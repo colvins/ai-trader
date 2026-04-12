@@ -1,0 +1,1 @@
+"""Core stock selection engine."""

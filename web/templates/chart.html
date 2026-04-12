@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AI Trader Chart</title>
+    <script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
+    <style>
+      :root {
+        --bg: #f6f2e8;
+        --panel: #fffdf8;
+        --line: #d8cfbf;
+        --text: #1d241f;
+        --muted: #6b756f;
+        --green: #17824d;
+        --yellow: #b98b00;
+        --gray: #7d848a;
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+        color: var(--text);
+        background:
+          radial-gradient(circle at top left, rgba(23,130,77,0.08), transparent 30%),
+          linear-gradient(180deg, #fbf8f1 0%, var(--bg) 100%);
+      }
+      .shell {
+        max-width: 1400px;
+        margin: 0 auto;
+        padding: 24px;
+      }
+      .topbar {
+        display: grid;
+        grid-template-columns: 360px 1fr;
+        gap: 20px;
+        margin-bottom: 20px;
+      }
+      .panel {
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 18px;
+        box-shadow: 0 10px 30px rgba(40, 36, 20, 0.05);
+      }
+      .controls {
+        padding: 18px;
+      }
+      .controls h1 {
+        margin: 0 0 6px;
+        font-size: 28px;
+      }
+      .controls p {
+        margin: 0 0 16px;
+        color: var(--muted);
+      }
+      .control-row {
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 10px;
+        align-items: center;
+      }
+      select, input, button {
+        padding: 12px 14px;
+        border-radius: 12px;
+        border: 1px solid var(--line);
+        background: white;
+        font: inherit;
+      }
+      button {
+        background: #1f6f49;
+        border-color: #1f6f49;
+        color: white;
+        cursor: pointer;
+      }
+      .summary {
+        padding: 18px;
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        align-items: center;
+      }
+      .pill {
+        padding: 10px 12px;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        background: #fff;
+      }
+      .content {
+        display: grid;
+        grid-template-columns: 300px 1fr 320px;
+        gap: 20px;
+      }
+      .side, .detail { padding: 18px; }
+      .section-title {
+        margin: 0 0 12px;
+        font-size: 16px;
+      }
+      #signal-list {
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+      }
+      .signal-item {
+        border: 1px solid var(--line);
+        border-radius: 14px;
+        padding: 12px;
+        cursor: pointer;
+        background: white;
+      }
+      .signal-item.active { border-color: #1f6f49; box-shadow: inset 0 0 0 1px #1f6f49; }
+      .signal-meta {
+        display: flex;
+        justify-content: space-between;
+        margin-bottom: 8px;
+        font-size: 13px;
+        color: var(--muted);
+      }
+      .tag {
+        display: inline-block;
+        padding: 4px 8px;
+        border-radius: 999px;
+        color: white;
+        font-size: 12px;
+      }
+      .tag.A { background: var(--green); }
+      .tag.B { background: var(--yellow); color: #1d241f; }
+      .tag.C { background: var(--gray); }
+      .chart-panel { padding: 12px; }
+      #chart { height: 620px; }
+      .detail pre {
+        margin: 0;
+        white-space: pre-wrap;
+        word-break: break-word;
+        font-family: inherit;
+        line-height: 1.6;
+      }
+      .hint { color: var(--muted); font-size: 13px; }
+      @media (max-width: 1100px) {
+        .content, .topbar { grid-template-columns: 1fr; }
+        #chart { height: 420px; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <div class="topbar">
+        <section class="panel controls">
+          <h1>信号 K 线查看器</h1>
+          <p>基于本地 `jq_daily` 与 `signals_with_results.csv`，查看信号与后续表现。</p>
+          <div class="control-row">
+            <select id="symbol-select"></select>
+            <button id="reload-btn">加载</button>
+          </div>
+        </section>
+        <section class="panel summary" id="summary-bar">
+          <div class="pill">等待加载信号列表…</div>
+        </section>
+      </div>
+
+      <div class="content">
+        <aside class="panel side">
+          <h2 class="section-title">最近信号</h2>
+          <div id="signal-list"></div>
+        </aside>
+
+        <main class="panel chart-panel">
+          <div id="chart"></div>
+        </main>
+
+        <aside class="panel detail">
+          <h2 class="section-title">信号详情</h2>
+          <div class="hint">点击左侧信号项查看详细信息。</div>
+          <pre id="signal-detail">暂无信号详情</pre>
+        </aside>
+      </div>
+    </div>
+    <script src="/static/chart.js"></script>
+  </body>
+  </html>
