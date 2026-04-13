@@ -13,6 +13,12 @@ MODE_LABELS = {
     "dip": "🧲 低吸反弹",
 }
 
+ACTION_LABELS = {
+    "buy": "买入",
+    "watch": "观察",
+    "ignore": "忽略",
+}
+
 
 def format_pick_result(result: PickResult) -> str:
     mode_text = MODE_LABELS.get(result.mode, result.mode)
@@ -21,7 +27,8 @@ def format_pick_result(result: PickResult) -> str:
     lines = [
         "📌 交易决策提示",
         f"市场状态: {market_state.state or '-'} | 上涨占比: {up_ratio_pct}% | 平均涨幅: {market_state.avg_change_pct}%",
-        f"当前策略: {result.mode} ({mode_text}) | {'自动选择' if result.mode_source == 'auto' else '手动指定'}",
+        f"策略类型: {mode_text}",
+        f"策略来源: {'自动选择' if result.mode_source == 'auto' else '手动指定'}",
         "",
     ]
 
@@ -42,28 +49,40 @@ def format_pick_result(result: PickResult) -> str:
         lines.append("")
 
     if a_picks:
-        lines.append("A级（buy）")
+        lines.append("A级（买入）")
         for pick in a_picks:
             lines.append(
-                f"- {pick.symbol} | ¥{pick.close} | score={pick.score} | {pick.reason}"
+                f"- {pick.symbol} | ¥{pick.close} | 得分={pick.score} | 操作建议={ACTION_LABELS.get(pick.action, pick.action)} | {pick.reason}"
             )
             lines.append(
-                f"  期权: {pick.option_bias or '-'} | {pick.option_horizon or '-'} | {pick.option_reason or '-'}"
+                f"  期权方向: {pick.option_bias or '暂无'} | 参考周期: {pick.option_horizon or '暂无'}"
+            )
+            lines.append(
+                f"  期权逻辑: {pick.option_reason or '暂无'} | 主要风险: {pick.option_risk or '暂无'}"
+            )
+            lines.append(
+                f"  公告信号: {str(pick.raw.get('tdnet_signal', '') or '暂无')} | 公告标题: {str(pick.raw.get('tdnet_title', '') or '暂无')}"
             )
         lines.append("")
 
     if b_picks:
-        lines.append("B级（watch）")
+        lines.append("B级（观察）")
         for pick in b_picks:
             lines.append(
-                f"- {pick.symbol} | ¥{pick.close} | score={pick.score} | {pick.reason}"
+                f"- {pick.symbol} | ¥{pick.close} | 得分={pick.score} | 操作建议={ACTION_LABELS.get(pick.action, pick.action)} | {pick.reason}"
             )
             lines.append(
-                f"  期权: {pick.option_bias or '-'} | {pick.option_horizon or '-'} | {pick.option_reason or '-'}"
+                f"  期权方向: {pick.option_bias or '暂无'} | 参考周期: {pick.option_horizon or '暂无'}"
+            )
+            lines.append(
+                f"  期权逻辑: {pick.option_reason or '暂无'} | 主要风险: {pick.option_risk or '暂无'}"
+            )
+            lines.append(
+                f"  公告信号: {str(pick.raw.get('tdnet_signal', '') or '暂无')} | 公告标题: {str(pick.raw.get('tdnet_title', '') or '暂无')}"
             )
         lines.append("")
 
-    lines.append(f"C级（ignore）数量: {c_count}")
+    lines.append(f"C级（忽略）数量: {c_count}")
 
     return "\n".join(lines)
 

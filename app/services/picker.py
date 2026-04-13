@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from analysis.local_ranker import DEFAULT_MODE
+from analysis.local_ranker import DEFAULT_MODE, SUPPORTED_MODES
 from analysis.local_ranker import analyze_stocks
 from analysis.news_service import get_news_for_stocks
 from engine.market_state import analyze_market_state
@@ -12,12 +12,16 @@ from storage.signal_store import save_pick_result_signals
 from storage.runtime_state import get_data_status_summary
 
 
-def _build_result(limit=5, candidate_limit=30, mode=DEFAULT_MODE):
+SCAN_MODE_SOURCE = "scan"
+SCAN_MODES = ("dip", "trend", "breakout")
+
+
+def _build_result(limit=5, candidate_limit=30, mode=DEFAULT_MODE, mode_source_override: str | None = None):
     status = get_data_status_summary()
     requested_mode = str(mode).strip().lower() if mode is not None else ""
     market_state = analyze_market_state()
     resolved_mode = requested_mode or market_state.get("mode", DEFAULT_MODE)
-    mode_source = "manual" if requested_mode else "auto"
+    mode_source = mode_source_override or ("manual" if requested_mode else "auto")
 
     candidates = get_candidate_stocks(limit=candidate_limit, mode=resolved_mode)
     if not candidates:
@@ -80,10 +84,31 @@ def _pick_to_legacy_dict(pick):
     }
 
 
-def run_picker_result(limit=5, candidate_limit=30, mode=DEFAULT_MODE):
-    result = _build_result(limit=limit, candidate_limit=candidate_limit, mode=mode)
+def run_picker_result(limit=5, candidate_limit=30, mode=DEFAULT_MODE, mode_source_override: str | None = None):
+    result = _build_result(
+        limit=limit,
+        candidate_limit=candidate_limit,
+        mode=mode,
+        mode_source_override=mode_source_override,
+    )
     save_pick_result_signals(result)
     return result
+
+
+def run_multi_mode_scan_results(limit=5, candidate_limit=30, modes: tuple[str, ...] = SCAN_MODES):
+    results = []
+    for mode in modes:
+        if mode not in SUPPORTED_MODES:
+            continue
+        results.append(
+            run_picker_result(
+                limit=limit,
+                candidate_limit=candidate_limit,
+                mode=mode,
+                mode_source_override=SCAN_MODE_SOURCE,
+            )
+        )
+    return results
 
 
 def build_pick_result_payload(limit=5, candidate_limit=30, mode=DEFAULT_MODE):
@@ -114,5 +139,6 @@ __all__ = [
     "pick_stocks",
     "run_picker",
     "run_picker_legacy_dicts",
+    "run_multi_mode_scan_results",
     "run_picker_result",
 ]
