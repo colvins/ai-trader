@@ -16,14 +16,24 @@ SCAN_MODE_SOURCE = "scan"
 SCAN_MODES = ("dip", "trend", "breakout")
 
 
-def _build_result(limit=5, candidate_limit=30, mode=DEFAULT_MODE, mode_source_override: str | None = None):
-    status = get_data_status_summary()
+def _build_result(
+    limit=5,
+    candidate_limit=30,
+    mode=DEFAULT_MODE,
+    mode_source_override: str | None = None,
+    *,
+    status=None,
+    market_state=None,
+    candidates: list[dict] | None = None,
+    news_map: dict | None = None,
+):
+    status = status or get_data_status_summary()
     requested_mode = str(mode).strip().lower() if mode is not None else ""
-    market_state = analyze_market_state()
+    market_state = market_state or analyze_market_state()
     resolved_mode = requested_mode or market_state.get("mode", DEFAULT_MODE)
     mode_source = mode_source_override or ("manual" if requested_mode else "auto")
 
-    candidates = get_candidate_stocks(limit=candidate_limit, mode=resolved_mode)
+    candidates = candidates if candidates is not None else get_candidate_stocks(limit=candidate_limit, mode=resolved_mode)
     if not candidates:
         return build_pick_result(
             mode=resolved_mode,
@@ -37,7 +47,7 @@ def _build_result(limit=5, candidate_limit=30, mode=DEFAULT_MODE, mode_source_ov
             mode_source=mode_source,
         )
 
-    news_map = get_news_for_stocks(candidates, max_items=5)
+    news_map = news_map if news_map is not None else get_news_for_stocks(candidates, max_items=5)
     scored = analyze_stocks(candidates, news_map=news_map, mode=resolved_mode)
     return build_pick_result(
         mode=resolved_mode,
@@ -96,18 +106,43 @@ def run_picker_result(limit=5, candidate_limit=30, mode=DEFAULT_MODE, mode_sourc
 
 
 def run_multi_mode_scan_results(limit=5, candidate_limit=30, modes: tuple[str, ...] = SCAN_MODES):
+    valid_modes = [mode for mode in modes if mode in SUPPORTED_MODES]
+    if not valid_modes:
+        return []
+
+    status = get_data_status_summary()
+    market_state = analyze_market_state()
+    candidates_by_mode: dict[str, list[dict]] = {}
+    merged_candidates: dict[str, dict] = {}
+
+    for mode in valid_modes:
+        candidates = get_candidate_stocks(limit=candidate_limit, mode=mode)
+        candidates_by_mode[mode] = candidates
+        for candidate in candidates:
+            symbol = str(candidate.get("symbol", "") or "").strip()
+            if symbol and symbol not in merged_candidates:
+                merged_candidates[symbol] = candidate
+
+    shared_news_map = (
+        get_news_for_stocks(list(merged_candidates.values()), max_items=5)
+        if merged_candidates
+        else {}
+    )
+
     results = []
-    for mode in modes:
-        if mode not in SUPPORTED_MODES:
-            continue
-        results.append(
-            run_picker_result(
+    for mode in valid_modes:
+        result = _build_result(
                 limit=limit,
                 candidate_limit=candidate_limit,
                 mode=mode,
                 mode_source_override=SCAN_MODE_SOURCE,
+                status=status,
+                market_state=market_state,
+                candidates=candidates_by_mode.get(mode, []),
+                news_map=shared_news_map,
             )
-        )
+        save_pick_result_signals(result)
+        results.append(result)
     return results
 
 

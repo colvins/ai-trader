@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from pathlib import Path
 
+import pandas as pd
 from tdnet_source import fetch_tdnet
 
 
@@ -126,7 +128,7 @@ BEARISH_KEYWORDS = [
     "warning", "delay", "probe", "fraud", "decline", "slump",
 ]
 
-LEADER_SYMBOLS = {
+DEFAULT_LEADER_SYMBOLS = {
     "7203",
     "6758",
     "9984",
@@ -136,6 +138,38 @@ LEADER_SYMBOLS = {
     "9432",
     "8306",
 }
+LEADER_SYMBOLS_FILE = Path("data/leader_symbols.csv")
+
+
+def _load_leader_symbols() -> set[str]:
+    if not LEADER_SYMBOLS_FILE.exists():
+        return set(DEFAULT_LEADER_SYMBOLS)
+
+    try:
+        df = pd.read_csv(LEADER_SYMBOLS_FILE, encoding="utf-8-sig")
+    except Exception:
+        return set(DEFAULT_LEADER_SYMBOLS)
+
+    column = None
+    for candidate in ("symbol", "code", "ticker"):
+        if candidate in df.columns:
+            column = candidate
+            break
+    if column is None:
+        return set(DEFAULT_LEADER_SYMBOLS)
+
+    values = (
+        df[column]
+        .dropna()
+        .astype(str)
+        .str.replace(".0", "", regex=False)
+        .str.strip()
+    )
+    symbols = {value for value in values.tolist() if value}
+    return symbols or set(DEFAULT_LEADER_SYMBOLS)
+
+
+LEADER_SYMBOLS = _load_leader_symbols()
 
 
 def _news_time_weight(item):
@@ -552,20 +586,6 @@ def _technical_score_trend(stock):
     return total, parts[:4] or ["技术面中性"]
 
 
-def _score_dip_intraday(day_pct):
-    if day_pct <= -5:
-        return -0.10, "今日仍偏弱"
-    if day_pct < -2:
-        return -0.05, "抛压仍在"
-    if day_pct < 1.5:
-        return 0.05, "今日企稳"
-    if day_pct < 4:
-        return 0.08, "今日反弹"
-    if day_pct < 6:
-        return 0.04, "反弹力度良好"
-    return -0.03, "反弹略急"
-
-
 def _score_dip_day_change(day_pct):
     if day_pct <= -2:
         return -0.08, "今日涨幅偏弱"
@@ -580,21 +600,6 @@ def _score_dip_day_change(day_pct):
     if day_pct < 6:
         return 0.07, "今日反弹较强"
     return 0.02, "今日涨幅偏急"
-
-
-def _score_dip_day_change_boost(day_pct):
-    normalized = max(0.0, min(day_pct / 5.0, 1.6))
-    boost = (normalized ** 1.5) * 0.14
-
-    if boost >= 0.10:
-        reason = "今日涨幅强势放大"
-    elif boost >= 0.06:
-        reason = "今日涨幅强化"
-    elif boost > 0:
-        reason = "今日涨幅加分"
-    else:
-        reason = "今日涨幅无强化"
-    return boost, reason
 
 
 def _score_dip_amplitude(pct):
@@ -668,35 +673,6 @@ def _score_dip_momentum(m3, m5, history_days):
     return _clamp(score, -0.12, 0.18), " + ".join(reasons[:2]) or "动量中性"
 
 
-def _score_dip_momentum_3_only(m3):
-    if m3 <= -5:
-        return -0.08, "3日修复不足"
-    if m3 < -1:
-        return -0.03, "3日仍偏弱"
-    if m3 < 1:
-        return 0.02, "3日止跌企稳"
-    if m3 < 3:
-        return 0.07, "3日开始转强"
-    if m3 < 6:
-        return 0.10, "3日反弹明确"
-    return 0.06, "3日修复较快"
-
-
-def _score_dip_momentum_3_boost(m3):
-    normalized = max(0.0, min(m3 / 5.0, 1.8))
-    boost = (normalized ** 1.3) * 0.10
-
-    if boost >= 0.07:
-        reason = "3日动量强势放大"
-    elif boost >= 0.04:
-        reason = "3日动量强化"
-    elif boost > 0:
-        reason = "3日动量加分"
-    else:
-        reason = "3日动量无强化"
-    return boost, reason
-
-
 def _score_dip_high(dist_5, dist_20):
     score = 0.0
     reasons = []
@@ -716,12 +692,9 @@ def _score_dip_high(dist_5, dist_20):
     elif -5 < dist_20 <= -2:
         score += 0.03
         reasons.append("中期位置尚可")
-    elif -20 <= dist_20 < -15:
+    elif -20 < dist_20 < -15:
         score += 0.04
         reasons.append("回撤偏深")
-    elif dist_20 < -20:
-        score -= 0.08
-        reasons.append("离20日高点过远")
     elif dist_20 > -2:
         score -= 0.05
         reasons.append("已接近高位")
@@ -731,8 +704,6 @@ def _score_dip_high(dist_5, dist_20):
 def _score_dip_position_bias(dist_20):
     if dist_20 > -10:
         return -0.10, "中期位置偏高"
-    if dist_20 < -20:
-        return 0.06, "中期低位加分"
     return 0.0, "中期位置中性"
 
 
@@ -785,9 +756,6 @@ def _dip_score_multiplier(dist_20, amount_ratio_5):
     elif dist_20 > -10:
         multiplier *= 0.75
         reasons.append("偏高位置乘法降权")
-    elif dist_20 < -20:
-        multiplier *= 1.1
-        reasons.append("低位反弹乘法加权")
 
     if amount_ratio_5 < 1:
         multiplier *= 0.85
@@ -812,7 +780,7 @@ def _dip_entry_quality_multiplier(dist_20, close_position, day_pct, momentum_5_p
         multiplier *= 0.7
         reasons.append("趋势过强降权")
 
-    if dist_20 < -15:
+    if -20 < dist_20 < -15:
         multiplier *= 1.2
         reasons.append("低位启动加权")
 
@@ -823,14 +791,10 @@ def _technical_score_dip(stock):
     parts = []
     total = 0.0
     for scorer in (
-        lambda: _score_dip_intraday(stock.get("day_change_pct", 0.0)),
         lambda: _score_dip_day_change(stock.get("day_change_pct", 0.0)),
-        lambda: _score_dip_day_change_boost(stock.get("day_change_pct", 0.0)),
         lambda: _score_dip_amplitude(stock.get("amplitude_pct", 0.0)),
         lambda: _score_dip_amount(stock.get("amount", 0.0), stock.get("amount_ratio_5", 1.0)),
         lambda: _score_dip_momentum(stock.get("momentum_3_pct", 0.0), stock.get("momentum_5_pct", 0.0), stock.get("history_days", 0.0)),
-        lambda: _score_dip_momentum_3_only(stock.get("momentum_3_pct", 0.0)),
-        lambda: _score_dip_momentum_3_boost(stock.get("momentum_3_pct", 0.0)),
         lambda: _score_dip_high(stock.get("dist_to_high_5_pct", 0.0), stock.get("dist_to_high_20_pct", 0.0)),
         lambda: _score_dip_candle(stock.get("close_position", 0.5), stock.get("body_pct", 0.0)),
         lambda: _score_dip_close_position_boost(stock.get("close_position", 0.5)),

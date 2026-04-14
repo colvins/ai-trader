@@ -136,15 +136,17 @@ def _load_stored_scan_results_for_today() -> list[PickResult]:
     if current.empty:
         return []
 
-    modes_present = set(current["selected_mode"].dropna().tolist())
-    if not all(mode in modes_present for mode in SCAN_MODES):
-        return []
-
     results = []
     for mode in SCAN_MODES:
         mode_frame = current[current["selected_mode"] == mode].copy()
+        if mode_frame.empty:
+            continue
         results.append(_build_result_from_rows(mode, date.today().isoformat(), "scan", mode_frame))
     return results
+
+
+def _load_stored_scan_result_map_for_today() -> dict[str, PickResult]:
+    return {result.mode: result for result in _load_stored_scan_results_for_today()}
 
 
 def _load_stored_single_mode_result_for_today(mode: str) -> PickResult | None:
@@ -277,10 +279,20 @@ def _build_console_output(result, *, strategy_source_label: str | None = None) -
 
 
 def _get_multi_mode_results_for_cli(limit: int, candidate_limit: int) -> tuple[list[PickResult], bool]:
-    stored_results = _load_stored_scan_results_for_today()
-    if stored_results:
-        return stored_results, False
-    return run_multi_mode_scan_results(limit=limit, candidate_limit=candidate_limit), True
+    stored_result_map = _load_stored_scan_result_map_for_today()
+    missing_modes = [mode for mode in SCAN_MODES if mode not in stored_result_map]
+
+    if missing_modes:
+        rerun_results = run_multi_mode_scan_results(
+            limit=limit,
+            candidate_limit=candidate_limit,
+            modes=tuple(missing_modes),
+        )
+        for result in rerun_results:
+            stored_result_map[result.mode] = result
+
+    ordered_results = [stored_result_map[mode] for mode in SCAN_MODES if mode in stored_result_map]
+    return ordered_results, bool(missing_modes)
 
 
 def _get_single_mode_result_for_cli(mode: str | None, limit: int, candidate_limit: int) -> tuple[PickResult, bool]:

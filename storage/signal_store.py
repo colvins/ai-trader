@@ -54,6 +54,15 @@ SIGNAL_COLUMNS = [
     "is_repeat_signal",
     "consecutive_days",
 ]
+SIGNAL_ID_REQUIRED_COLUMNS = ["run_date", "selected_mode", "strategy_source", "symbol", "rank"]
+SIGNAL_MARKER_COLUMNS = [
+    "signal_id",
+    "run_date",
+    "selected_mode",
+    "symbol",
+    "is_repeat_signal",
+    "consecutive_days",
+]
 
 
 def build_signal_id(
@@ -105,6 +114,31 @@ def _ensure_signal_columns(df: pd.DataFrame) -> pd.DataFrame:
     return current
 
 
+def _ensure_signal_ids(df: pd.DataFrame) -> pd.DataFrame:
+    current = df.copy()
+    if "signal_id" not in current.columns:
+        current["signal_id"] = ""
+    else:
+        current["signal_id"] = current["signal_id"].fillna("").astype(str).str.strip()
+
+    missing_mask = current["signal_id"] == ""
+    if not bool(missing_mask.any()):
+        return current
+
+    run_date = current["run_date"].fillna("").astype(str).str.strip() if "run_date" in current.columns else ""
+    selected_mode = current["selected_mode"].fillna("").astype(str).str.strip() if "selected_mode" in current.columns else ""
+    strategy_source = current["strategy_source"].fillna("").astype(str).str.strip() if "strategy_source" in current.columns else ""
+    symbol = current["symbol"].fillna("").astype(str).str.strip() if "symbol" in current.columns else ""
+    rank = (
+        pd.to_numeric(current["rank"], errors="coerce").fillna(0).astype(int).astype(str)
+        if "rank" in current.columns
+        else "0"
+    )
+    generated_ids = run_date + "|" + selected_mode + "|" + strategy_source + "|" + symbol + "|" + rank
+    current.loc[missing_mask, "signal_id"] = generated_ids.loc[missing_mask]
+    return current
+
+
 def _pick_primary_news_fields(pick) -> tuple[str, str, str]:
     items = getattr(pick, "news_items", []) or []
     for item in items:
@@ -118,7 +152,7 @@ def _pick_primary_news_fields(pick) -> tuple[str, str, str]:
 
 
 def attach_repeat_signal_markers(df: pd.DataFrame) -> pd.DataFrame:
-    current = _ensure_signal_columns(df)
+    current = _ensure_signal_ids(_ensure_signal_columns(df))
     if current.empty:
         return current
 
@@ -126,50 +160,56 @@ def attach_repeat_signal_markers(df: pd.DataFrame) -> pd.DataFrame:
     current["_symbol_key"] = current["symbol"].astype(str).str.replace(".0", "", regex=False).str.strip()
     current["_mode_key"] = current["selected_mode"].astype(str).str.strip().str.lower()
 
-    valid_dates = (
-        current["_run_date_dt"].dropna().drop_duplicates().sort_values().tolist()
-    )
-    previous_date_map = {
-        valid_dates[index]: (valid_dates[index - 1] if index > 0 else pd.NaT)
-        for index in range(len(valid_dates))
-    }
-
     current["is_repeat_signal"] = 0
     current["consecutive_days"] = 1
+    valid_dates = (
+        current["_run_date_dt"]
+        .dropna()
+        .drop_duplicates()
+        .sort_values()
+        .to_frame(name="_run_date_dt")
+    )
+    if valid_dates.empty:
+        return current.drop(columns=["_run_date_dt", "_symbol_key", "_mode_key"], errors="ignore")
 
-    unique_signals = current.dropna(subset=["_run_date_dt"]).copy()
-    unique_signals = unique_signals.drop_duplicates(subset=["_symbol_key", "_mode_key", "_run_date_dt"])
-    unique_signals = unique_signals.sort_values(["_symbol_key", "_mode_key", "_run_date_dt"])
+    valid_dates["_expected_previous"] = valid_dates["_run_date_dt"].shift(1)
 
-    consecutive_map: dict[tuple[str, str, pd.Timestamp], int] = {}
-    for (symbol_key, mode_key), group in unique_signals.groupby(["_symbol_key", "_mode_key"], sort=False):
-        streak = 0
-        previous_seen_date = pd.NaT
+    unique_signals = (
+        current.loc[current["_run_date_dt"].notna(), ["_symbol_key", "_mode_key", "_run_date_dt"]]
+        .drop_duplicates(subset=["_symbol_key", "_mode_key", "_run_date_dt"])
+        .sort_values(["_symbol_key", "_mode_key", "_run_date_dt"])
+        .merge(valid_dates, on="_run_date_dt", how="left")
+    )
 
-        for _, row in group.iterrows():
-            run_date = row["_run_date_dt"]
-            expected_previous = previous_date_map.get(run_date, pd.NaT)
-            if pd.notna(expected_previous) and previous_seen_date == expected_previous:
-                streak += 1
-            else:
-                streak = 1
-            consecutive_map[(symbol_key, mode_key, run_date)] = streak
-            previous_seen_date = run_date
+    group_keys = ["_symbol_key", "_mode_key"]
+    unique_signals["_previous_seen_date"] = unique_signals.groupby(group_keys, sort=False)["_run_date_dt"].shift(1)
+    unique_signals["_is_consecutive"] = unique_signals["_previous_seen_date"].eq(unique_signals["_expected_previous"])
+    unique_signals["_streak_break"] = (~unique_signals["_is_consecutive"]).astype(int)
+    unique_signals["_streak_id"] = unique_signals.groupby(group_keys, sort=False)["_streak_break"].cumsum()
+    unique_signals["consecutive_days"] = (
+        unique_signals.groupby(group_keys + ["_streak_id"], sort=False).cumcount() + 1
+    )
 
-    def _lookup_consecutive_days(row: pd.Series) -> int:
-        run_date = row["_run_date_dt"]
-        if pd.isna(run_date):
-            return 1
-        return int(
-            consecutive_map.get(
-                (row["_symbol_key"], row["_mode_key"], run_date),
-                1,
-            )
-        )
-
-    current["consecutive_days"] = current.apply(_lookup_consecutive_days, axis=1)
+    marker_lookup = unique_signals[["_symbol_key", "_mode_key", "_run_date_dt", "consecutive_days"]]
+    current = current.merge(
+        marker_lookup,
+        on=["_symbol_key", "_mode_key", "_run_date_dt"],
+        how="left",
+        suffixes=("", "_computed"),
+    )
+    current["consecutive_days"] = (
+        pd.to_numeric(current["consecutive_days_computed"], errors="coerce").fillna(1).astype(int)
+    )
     current["is_repeat_signal"] = (current["consecutive_days"] > 1).astype(int)
-    return current.drop(columns=["_run_date_dt", "_symbol_key", "_mode_key"], errors="ignore")
+    return current.drop(
+        columns=[
+            "_run_date_dt",
+            "_symbol_key",
+            "_mode_key",
+            "consecutive_days_computed",
+        ],
+        errors="ignore",
+    )
 
 
 def build_signal_rows(result: PickResult) -> list[dict]:
@@ -232,55 +272,137 @@ def build_signal_rows(result: PickResult) -> list[dict]:
     return rows
 
 
-def save_pick_result_signals(result: PickResult, path: Path | None = None) -> Path:
-    target = path or SIGNALS_FILE
-    target.parent.mkdir(parents=True, exist_ok=True)
+def _signal_marker_map(df: pd.DataFrame) -> dict[str, dict[str, int]]:
+    if df.empty:
+        return {}
+    current = _ensure_signal_ids(df)
+    marker_frame = (
+        current[["signal_id", "is_repeat_signal", "consecutive_days"]]
+        .drop_duplicates(subset=["signal_id"], keep="last")
+        .copy()
+    )
+    return marker_frame.set_index("signal_id")[["is_repeat_signal", "consecutive_days"]].to_dict(orient="index")
 
-    new_rows = build_signal_rows(result)
-    new_df = pd.DataFrame(new_rows, columns=SIGNAL_COLUMNS)
 
+def _apply_signal_markers_to_result(result: PickResult, marker_map: dict[str, dict[str, int]], rows: list[dict]) -> None:
+    for pick, row in zip(result.picks, rows):
+        markers = marker_map.get(row["signal_id"], {})
+        pick.raw["is_repeat_signal"] = int(markers.get("is_repeat_signal", 0) or 0)
+        pick.raw["consecutive_days"] = int(markers.get("consecutive_days", 1) or 1)
+
+
+def _read_signal_header(target: Path) -> list[str]:
+    try:
+        return list(pd.read_csv(target, encoding="utf-8-sig", nrows=0).columns)
+    except Exception:
+        return []
+
+
+def _can_append_without_rewrite(target: Path, new_df: pd.DataFrame) -> bool:
+    if not target.exists():
+        return False
+    header_columns = _read_signal_header(target)
+    if not header_columns:
+        return False
+    if set(header_columns) != set(SIGNAL_COLUMNS):
+        return False
+
+    try:
+        existing_meta = pd.read_csv(
+            target,
+            encoding="utf-8-sig",
+            usecols=["signal_id", "run_date"],
+        )
+    except Exception:
+        return False
+
+    existing_meta = _ensure_signal_ids(existing_meta)
+    if existing_meta.empty:
+        return True
+
+    existing_ids = set(existing_meta["signal_id"].astype(str).str.strip().tolist())
+    new_ids = set(new_df["signal_id"].astype(str).str.strip().tolist())
+    if existing_ids.intersection(new_ids):
+        return False
+
+    existing_max_date = pd.to_datetime(existing_meta["run_date"], errors="coerce").max()
+    new_min_date = pd.to_datetime(new_df["run_date"], errors="coerce").min()
+    if pd.notna(existing_max_date) and pd.notna(new_min_date) and new_min_date < existing_max_date:
+        return False
+    return True
+
+
+def _compute_append_markers(target: Path, new_df: pd.DataFrame) -> pd.DataFrame:
+    existing_meta = pd.read_csv(
+        target,
+        encoding="utf-8-sig",
+        usecols=SIGNAL_MARKER_COLUMNS,
+    )
+    marker_source = pd.concat(
+        [
+            _ensure_signal_ids(_ensure_signal_columns(existing_meta))[SIGNAL_MARKER_COLUMNS],
+            new_df[SIGNAL_MARKER_COLUMNS],
+        ],
+        ignore_index=True,
+    )
+    marked = attach_repeat_signal_markers(marker_source)
+    new_markers = (
+        marked[marked["signal_id"].isin(new_df["signal_id"])]
+        [["signal_id", "is_repeat_signal", "consecutive_days"]]
+        .drop_duplicates(subset=["signal_id"], keep="last")
+    )
+    appended = new_df.drop(columns=["is_repeat_signal", "consecutive_days"], errors="ignore").merge(
+        new_markers,
+        on="signal_id",
+        how="left",
+    )
+    appended["is_repeat_signal"] = pd.to_numeric(appended["is_repeat_signal"], errors="coerce").fillna(0).astype(int)
+    appended["consecutive_days"] = pd.to_numeric(appended["consecutive_days"], errors="coerce").fillna(1).astype(int)
+    return appended[SIGNAL_COLUMNS].copy()
+
+
+def _rewrite_signal_file(target: Path, new_df: pd.DataFrame) -> pd.DataFrame:
     if target.exists():
         try:
             old_df = pd.read_csv(target, encoding="utf-8-sig")
         except Exception:
             old_df = pd.DataFrame(columns=SIGNAL_COLUMNS)
-
-        if not old_df.empty:
-            if "signal_id" not in old_df.columns:
-                old_df["signal_id"] = pd.NA
-            missing_mask = old_df["signal_id"].isna() | (old_df["signal_id"].astype(str).str.strip() == "")
-            if missing_mask.any():
-                old_df.loc[missing_mask, "signal_id"] = old_df.loc[missing_mask].apply(
-                    lambda row: build_signal_id(
-                        run_date=row.get("run_date", ""),
-                        selected_mode=row.get("selected_mode", ""),
-                        strategy_source=row.get("strategy_source", ""),
-                        symbol=row.get("symbol", ""),
-                        rank=int(row.get("rank", 0) or 0),
-                    ),
-                    axis=1,
-                )
-        combined = pd.concat([old_df, new_df], ignore_index=True)
     else:
-        combined = new_df
+        old_df = pd.DataFrame(columns=SIGNAL_COLUMNS)
 
+    old_df = _ensure_signal_ids(_ensure_signal_columns(old_df))
+    combined = pd.concat([old_df, new_df], ignore_index=True)
+    combined = combined.drop_duplicates(subset=["signal_id"], keep="last")
     combined = attach_repeat_signal_markers(combined)
     combined = combined[SIGNAL_COLUMNS].copy()
-    combined = combined.drop_duplicates(
-        subset=["signal_id"],
-        keep="last",
-    )
     combined = combined.sort_values(["run_date", "selected_mode", "rank", "symbol"]).reset_index(drop=True)
     combined.to_csv(target, index=False, encoding="utf-8-sig")
+    return combined
 
-    signal_marker_map = (
-        combined.set_index("signal_id")[["is_repeat_signal", "consecutive_days"]].to_dict(orient="index")
-        if not combined.empty
-        else {}
-    )
-    for pick, row in zip(result.picks, new_rows):
-        markers = signal_marker_map.get(row["signal_id"], {})
-        pick.raw["is_repeat_signal"] = int(markers.get("is_repeat_signal", 0) or 0)
-        pick.raw["consecutive_days"] = int(markers.get("consecutive_days", 1) or 1)
+
+def save_pick_result_signals(result: PickResult, path: Path | None = None) -> Path:
+    target = path or SIGNALS_FILE
+    target.parent.mkdir(parents=True, exist_ok=True)
+
+    new_rows = build_signal_rows(result)
+    new_df = _ensure_signal_ids(_ensure_signal_columns(pd.DataFrame(new_rows, columns=SIGNAL_COLUMNS)))
+
+    if not target.exists():
+        combined = attach_repeat_signal_markers(new_df)
+        combined = combined[SIGNAL_COLUMNS].copy()
+        combined.to_csv(target, index=False, encoding="utf-8-sig")
+        _apply_signal_markers_to_result(result, _signal_marker_map(combined), new_rows)
+        return target
+
+    if _can_append_without_rewrite(target, new_df):
+        appended = _compute_append_markers(target, new_df)
+        header_columns = _read_signal_header(target)
+        appended = appended.reindex(columns=header_columns)
+        appended.to_csv(target, mode="a", header=False, index=False, encoding="utf-8-sig")
+        _apply_signal_markers_to_result(result, _signal_marker_map(appended), new_rows)
+        return target
+
+    combined = _rewrite_signal_file(target, new_df)
+    _apply_signal_markers_to_result(result, _signal_marker_map(combined), new_rows)
 
     return target
