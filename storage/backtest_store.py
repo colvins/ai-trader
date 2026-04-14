@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from storage.signal_store import attach_repeat_signal_markers
+
 
 BACKTEST_DIR = Path("data/backtest")
 SIGNALS_FILE = BACKTEST_DIR / "signals.csv"
@@ -55,7 +57,23 @@ def load_signals(path: Path | None = None) -> pd.DataFrame:
         df["tdnet_title"] = ""
     else:
         df["tdnet_title"] = df["tdnet_title"].fillna("")
-    return df
+
+    if "news_title" not in df.columns:
+        df["news_title"] = ""
+    else:
+        df["news_title"] = df["news_title"].fillna("")
+
+    if "news_source" not in df.columns:
+        df["news_source"] = ""
+    else:
+        df["news_source"] = df["news_source"].fillna("")
+
+    if "news_published_at" not in df.columns:
+        df["news_published_at"] = ""
+    else:
+        df["news_published_at"] = df["news_published_at"].fillna("")
+
+    return attach_repeat_signal_markers(df)
 
 
 def load_daily_price_index(data_dir: Path | None = None) -> dict[str, pd.DataFrame]:

@@ -34,6 +34,9 @@ SIGNAL_COLUMNS = [
     "tdnet_signal",
     "tdnet_score",
     "tdnet_title",
+    "news_title",
+    "news_source",
+    "news_published_at",
     "close",
     "prev_close",
     "day_change_pct",
@@ -45,6 +48,8 @@ SIGNAL_COLUMNS = [
     "dist_to_high_5_pct",
     "dist_to_high_20_pct",
     "close_position",
+    "is_repeat_signal",
+    "consecutive_days",
 ]
 
 
@@ -77,11 +82,96 @@ def _signal_run_date(result: PickResult) -> str:
     return ""
 
 
+def _ensure_signal_columns(df: pd.DataFrame) -> pd.DataFrame:
+    current = df.copy()
+    for col in SIGNAL_COLUMNS:
+        if col not in current.columns:
+            current[col] = pd.NA
+
+    current["tdnet_signal"] = current["tdnet_signal"].fillna("无").replace("", "无")
+    current["tdnet_score"] = pd.to_numeric(current["tdnet_score"], errors="coerce").fillna(0.0)
+    current["tdnet_title"] = current["tdnet_title"].fillna("")
+    current["news_title"] = current["news_title"].fillna("")
+    current["news_source"] = current["news_source"].fillna("")
+    current["news_published_at"] = current["news_published_at"].fillna("")
+    current["is_repeat_signal"] = pd.to_numeric(current["is_repeat_signal"], errors="coerce").fillna(0).astype(int)
+    current["consecutive_days"] = pd.to_numeric(current["consecutive_days"], errors="coerce").fillna(1).astype(int)
+    return current
+
+
+def _pick_primary_news_fields(pick) -> tuple[str, str, str]:
+    items = getattr(pick, "news_items", []) or []
+    for item in items:
+        title = str(getattr(item, "title", "") or "").strip()
+        if not title:
+            continue
+        source = str(getattr(item, "source", "") or "").strip()
+        published_at = str(getattr(item, "published_at", "") or "").strip()
+        return title, source, published_at
+    return "", "", ""
+
+
+def attach_repeat_signal_markers(df: pd.DataFrame) -> pd.DataFrame:
+    current = _ensure_signal_columns(df)
+    if current.empty:
+        return current
+
+    current["_run_date_dt"] = pd.to_datetime(current["run_date"], errors="coerce").dt.normalize()
+    current["_symbol_key"] = current["symbol"].astype(str).str.replace(".0", "", regex=False).str.strip()
+    current["_mode_key"] = current["selected_mode"].astype(str).str.strip().str.lower()
+
+    valid_dates = (
+        current["_run_date_dt"].dropna().drop_duplicates().sort_values().tolist()
+    )
+    previous_date_map = {
+        valid_dates[index]: (valid_dates[index - 1] if index > 0 else pd.NaT)
+        for index in range(len(valid_dates))
+    }
+
+    current["is_repeat_signal"] = 0
+    current["consecutive_days"] = 1
+
+    unique_signals = current.dropna(subset=["_run_date_dt"]).copy()
+    unique_signals = unique_signals.drop_duplicates(subset=["_symbol_key", "_mode_key", "_run_date_dt"])
+    unique_signals = unique_signals.sort_values(["_symbol_key", "_mode_key", "_run_date_dt"])
+
+    consecutive_map: dict[tuple[str, str, pd.Timestamp], int] = {}
+    for (symbol_key, mode_key), group in unique_signals.groupby(["_symbol_key", "_mode_key"], sort=False):
+        streak = 0
+        previous_seen_date = pd.NaT
+
+        for _, row in group.iterrows():
+            run_date = row["_run_date_dt"]
+            expected_previous = previous_date_map.get(run_date, pd.NaT)
+            if pd.notna(expected_previous) and previous_seen_date == expected_previous:
+                streak += 1
+            else:
+                streak = 1
+            consecutive_map[(symbol_key, mode_key, run_date)] = streak
+            previous_seen_date = run_date
+
+    def _lookup_consecutive_days(row: pd.Series) -> int:
+        run_date = row["_run_date_dt"]
+        if pd.isna(run_date):
+            return 1
+        return int(
+            consecutive_map.get(
+                (row["_symbol_key"], row["_mode_key"], run_date),
+                1,
+            )
+        )
+
+    current["consecutive_days"] = current.apply(_lookup_consecutive_days, axis=1)
+    current["is_repeat_signal"] = (current["consecutive_days"] > 1).astype(int)
+    return current.drop(columns=["_run_date_dt", "_symbol_key", "_mode_key"], errors="ignore")
+
+
 def build_signal_rows(result: PickResult) -> list[dict]:
     run_date = _signal_run_date(result)
     rows = []
 
     for rank, pick in enumerate(result.picks, start=1):
+        news_title, news_source, news_published_at = _pick_primary_news_fields(pick)
         signal_id = build_signal_id(
             run_date=run_date,
             selected_mode=result.mode,
@@ -111,6 +201,9 @@ def build_signal_rows(result: PickResult) -> list[dict]:
                 "tdnet_signal": str(pick.raw.get("tdnet_signal", "无") or "无"),
                 "tdnet_score": pick.raw.get("tdnet_score", 0) or 0,
                 "tdnet_title": str(pick.raw.get("tdnet_title", "") or ""),
+                "news_title": news_title,
+                "news_source": news_source,
+                "news_published_at": news_published_at,
                 "close": pick.close,
                 "prev_close": pick.prev_close,
                 "day_change_pct": pick.day_change_pct,
@@ -122,6 +215,8 @@ def build_signal_rows(result: PickResult) -> list[dict]:
                 "dist_to_high_5_pct": pick.dist_to_high_5_pct,
                 "dist_to_high_20_pct": pick.dist_to_high_20_pct,
                 "close_position": pick.close_position,
+                "is_repeat_signal": int(pick.raw.get("is_repeat_signal", 0) or 0),
+                "consecutive_days": int(pick.raw.get("consecutive_days", 1) or 1),
             }
         )
 
@@ -160,14 +255,7 @@ def save_pick_result_signals(result: PickResult, path: Path | None = None) -> Pa
     else:
         combined = new_df
 
-    for col in SIGNAL_COLUMNS:
-        if col not in combined.columns:
-            combined[col] = pd.NA
-
-    combined["tdnet_signal"] = combined["tdnet_signal"].fillna("无").replace("", "无")
-    combined["tdnet_score"] = pd.to_numeric(combined["tdnet_score"], errors="coerce").fillna(0.0)
-    combined["tdnet_title"] = combined["tdnet_title"].fillna("")
-
+    combined = attach_repeat_signal_markers(combined)
     combined = combined[SIGNAL_COLUMNS].copy()
     combined = combined.drop_duplicates(
         subset=["signal_id"],
@@ -175,4 +263,15 @@ def save_pick_result_signals(result: PickResult, path: Path | None = None) -> Pa
     )
     combined = combined.sort_values(["run_date", "selected_mode", "rank", "symbol"]).reset_index(drop=True)
     combined.to_csv(target, index=False, encoding="utf-8-sig")
+
+    signal_marker_map = (
+        combined.set_index("signal_id")[["is_repeat_signal", "consecutive_days"]].to_dict(orient="index")
+        if not combined.empty
+        else {}
+    )
+    for pick, row in zip(result.picks, new_rows):
+        markers = signal_marker_map.get(row["signal_id"], {})
+        pick.raw["is_repeat_signal"] = int(markers.get("is_repeat_signal", 0) or 0)
+        pick.raw["consecutive_days"] = int(markers.get("consecutive_days", 1) or 1)
+
     return target

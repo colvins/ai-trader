@@ -158,12 +158,10 @@ def _news_time_weight(item):
         delta_days = (now - dt).total_seconds() / 86400.0
         if delta_days < 0:
             return 1.0
-        if delta_days <= 1:
-            return 1.0
-        if delta_days <= 2:
-            return 0.7
         if delta_days <= 3:
-            return 0.4
+            return 1.0
+        if delta_days <= 7:
+            return 0.5
         return 0.0
     except Exception:
         return 0.5

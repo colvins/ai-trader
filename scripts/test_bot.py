@@ -3,7 +3,11 @@ from __future__ import annotations
 import json
 import os
 import sys
+from collections import OrderedDict
+from datetime import datetime, timezone
 from pathlib import Path
+
+import pandas as pd
 
 # 关键：把项目根目录加入路径，解决 No module named 'app'
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -27,10 +31,11 @@ from analysis.execution_guard import (
 )
 from analysis.intraday_data import fetch_opening_intraday_bars
 from analysis.news_guard import evaluate_news_guard
-from app.services.picker import run_multi_mode_scan_results, run_picker_result
 from reporting.formatters.telegram_formatter import format_ai_prompt, format_pick_result
+from reporting.schemas import DataStatus, MarketState, NewsItem, PickResult, StockPick
 from scripts.run_backtest import SUMMARY_FILE, build_backtest_summary, save_backtest_summary
 from scripts.update_backtest_results import update_backtest_results
+from storage.backtest_store import load_signals
 from storage.runtime_state import get_bot_mode, save_bot_mode_state
 
 
@@ -107,6 +112,7 @@ MODE_BUTTON_TO_STATE = {
 
 LAST_RESULT = None
 LAST_SCAN_RESULTS = None
+SCAN_MODES = ("dip", "trend", "breakout")
 
 
 def log(msg: str):
@@ -120,6 +126,117 @@ def current_mode_label() -> str:
 def resolve_picker_mode() -> str | None:
     current = get_bot_mode()
     return None if current == "auto" else current
+
+
+def _signal_repeat_tag(raw: dict) -> str:
+    consecutive_days = int((raw or {}).get("consecutive_days", 1) or 1)
+    if consecutive_days <= 1:
+        return "新"
+    return f"连{consecutive_days}"
+
+
+def _stored_pick_reason(row: dict) -> str:
+    tdnet_signal = str(row.get("tdnet_signal", "") or "").strip()
+    option_reason = str(row.get("option_reason", "") or "").strip()
+    if tdnet_signal and tdnet_signal != "无":
+        return f"公告信号：{tdnet_signal}"
+    if option_reason:
+        return option_reason
+    return "已落盘信号"
+
+
+def _build_pick_from_row(row: dict) -> StockPick:
+    raw = dict(row)
+    news_items = []
+    news_title = str(row.get("news_title", "") or "").strip()
+    if news_title:
+        news_items.append(
+            NewsItem(
+                title=news_title,
+                source=str(row.get("news_source", "") or "").strip(),
+                published_at=str(row.get("news_published_at", "") or "").strip(),
+            )
+        )
+    return StockPick(
+        symbol=str(row.get("symbol", "") or "").strip(),
+        close=row.get("close"),
+        prev_close=row.get("prev_close"),
+        score=row.get("score"),
+        reason=_stored_pick_reason(row),
+        mode=str(row.get("selected_mode", "") or "").strip(),
+        level=str(row.get("level", "C") or "C").strip(),
+        action=str(row.get("action", "ignore") or "ignore").strip(),
+        option_bias=str(row.get("option_bias", "") or "").strip(),
+        option_horizon=str(row.get("option_horizon", "") or "").strip(),
+        option_reason=str(row.get("option_reason", "") or "").strip(),
+        option_risk=str(row.get("option_risk", "") or "").strip(),
+        day_change_pct=row.get("day_change_pct"),
+        intraday_pct=row.get("intraday_pct"),
+        amplitude_pct=row.get("amplitude_pct"),
+        amount_ratio_5=row.get("amount_ratio_5"),
+        momentum_3_pct=row.get("momentum_3_pct"),
+        momentum_5_pct=row.get("momentum_5_pct"),
+        dist_to_high_5_pct=row.get("dist_to_high_5_pct"),
+        dist_to_high_20_pct=row.get("dist_to_high_20_pct"),
+        close_position=row.get("close_position"),
+        news_items=news_items,
+        raw=raw,
+    )
+
+
+def _build_result_from_rows(mode: str, run_date: str, frame: pd.DataFrame) -> PickResult:
+    rows = frame.sort_values(["rank", "score", "symbol"], ascending=[True, False, True], na_position="last")
+    first = rows.iloc[0].to_dict() if not rows.empty else {}
+    picks = [_build_pick_from_row(row) for row in rows.to_dict(orient="records")]
+    market_state = MarketState(
+        state=str(first.get("market_state", "") or "").strip(),
+        up_ratio=float(first.get("market_up_ratio") or 0.0),
+        avg_change_pct=float(first.get("market_avg_change_pct") or 0.0),
+        data_date=run_date,
+    )
+    return PickResult(
+        mode=mode,
+        status=DataStatus(
+            ok=True,
+            title="",
+            text="",
+            data_date=run_date,
+            raw={"source": "data/backtest/signals.csv", "strategy_source": "scan"},
+        ),
+        market_state=market_state,
+        mode_source="scan",
+        picks=picks,
+        candidate_count=len(picks),
+        scored_count=len(picks),
+        candidate_limit=len(picks),
+        limit=len(picks),
+        generated_at=str(first.get("generated_at", "") or ""),
+    )
+
+
+def load_latest_stored_scan_results() -> tuple[str, list[PickResult]]:
+    df = load_signals()
+    if df.empty:
+        return "", []
+
+    current = df.copy()
+    current["run_date"] = current["run_date"].astype(str).str.strip()
+    current["strategy_source"] = current["strategy_source"].astype(str).str.strip().str.lower()
+    current["selected_mode"] = current["selected_mode"].astype(str).str.strip().str.lower()
+    current = current[current["strategy_source"] == "scan"].copy()
+    if current.empty:
+        return "", []
+
+    latest_run_date = current["run_date"].max()
+    current = current[current["run_date"] == latest_run_date].copy()
+    if current.empty:
+        return "", []
+
+    results = []
+    for mode in SCAN_MODES:
+        mode_frame = current[current["selected_mode"] == mode].copy()
+        results.append(_build_result_from_rows(mode, latest_run_date, mode_frame))
+    return latest_run_date, results
 
 
 def _group_picks(result):
@@ -154,16 +271,20 @@ def build_multi_mode_run_message(scan_results) -> str:
         if groups["A"]:
             lines.append("A级（买入）")
             for pick in groups["A"]:
+                repeat_tag = _signal_repeat_tag(getattr(pick, "raw", {}) or {})
                 lines.append(
-                    f"- {pick.symbol} | 得分={pick.score} | 操作建议={ACTION_LABELS.get(pick.action, pick.action)} | {pick.reason}"
+                    f"- {pick.symbol}（{repeat_tag}） | 得分={pick.score} | 操作建议={ACTION_LABELS.get(pick.action, pick.action)} | {pick.reason}"
                 )
+                lines.append(f"  新闻：{_pick_news_summary(pick)}")
 
         if groups["B"]:
             lines.append("B级（观察）")
             for pick in groups["B"][:3]:
+                repeat_tag = _signal_repeat_tag(getattr(pick, "raw", {}) or {})
                 lines.append(
-                    f"- {pick.symbol} | 得分={pick.score} | 操作建议={ACTION_LABELS.get(pick.action, pick.action)} | {pick.reason}"
+                    f"- {pick.symbol}（{repeat_tag}） | 得分={pick.score} | 操作建议={ACTION_LABELS.get(pick.action, pick.action)} | {pick.reason}"
                 )
+                lines.append(f"  新闻：{_pick_news_summary(pick)}")
 
         if not result.picks:
             lines.append("- 暂无候选")
@@ -173,34 +294,56 @@ def build_multi_mode_run_message(scan_results) -> str:
     return "\n".join(lines)
 
 
-def build_today_summary(result) -> str:
-    groups = _group_picks(result)
-    a_count = len(groups["A"])
-    b_picks = groups["B"][:3]
-    c_count = len(groups["C"])
-    market_state = result.market_state
+def build_today_summary(scan_results) -> str:
+    if not scan_results:
+        return "当前暂无当日三模式信号，请先确认 signals.csv 已落盘。"
+
+    total_a = 0
+    total_b = 0
+    total_c = 0
+    watch_list = []
+    market_state = None
+
+    for result in scan_results:
+        groups = _group_picks(result)
+        total_a += len(groups["A"])
+        total_b += len(groups["B"])
+        total_c += len(groups["C"])
+        market_state = market_state or result.market_state
+        for pick in groups["A"] + groups["B"]:
+            watch_list.append((result.mode, pick))
+
+    watch_list = sorted(
+        watch_list,
+        key=lambda item: (
+            0 if str(item[1].level or "").upper() == "A" else 1,
+            -(float(item[1].score or 0.0)),
+            str(item[1].symbol or ""),
+        ),
+    )[:5]
 
     lines = [
         "📌 今日结论",
-        f"市场状态: {market_state.state or '-'} | 上涨占比: {round(market_state.up_ratio * 100.0, 1)}%",
-        f"策略类型: {STRATEGY_LABELS.get(result.mode, result.mode)}",
-        f"策略来源: {'自动选择' if result.mode_source == 'auto' else '手动指定'}",
-        f"A/B/C 数量: {a_count}/{len(groups['B'])}/{c_count}",
+        f"市场状态: {market_state.state or '-'} | 上涨占比: {round((market_state.up_ratio or 0.0) * 100.0, 1)}%",
+        "信号范围: 当日已落盘三模式信号",
+        f"A/B/C 数量: {total_a}/{total_b}/{total_c}",
     ]
 
-    if a_count == 0:
+    if total_a == 0:
         lines.append("⚠️ 今日无明确买点，建议观望")
     else:
-        lines.append(f"✅ 今日有 {a_count} 个 A级买点")
+        lines.append(f"✅ 今日共有 {total_a} 个 A级买点")
 
-    if b_picks:
-        lines.extend(["", "B级前3"])
-        for pick in b_picks:
+    if watch_list:
+        lines.extend(["", "重点关注"])
+        for mode, pick in watch_list:
+            repeat_tag = _signal_repeat_tag(getattr(pick, "raw", {}) or {})
             lines.append(
-                f"- {pick.symbol} | 得分={pick.score} | 操作建议={ACTION_LABELS.get(pick.action, pick.action)} | {pick.reason}"
+                f"- {STRATEGY_LABELS.get(mode, mode)} | {pick.symbol}（{repeat_tag}） | 得分={pick.score} | 操作建议={ACTION_LABELS.get(pick.action, pick.action)}"
             )
+            lines.append(f"  新闻：{_pick_news_summary(pick)}")
 
-    lines.append(f"\nC级数量: {c_count}")
+    lines.append(f"\nC级数量: {total_c}")
     return "\n".join(lines)
 
 
@@ -326,6 +469,26 @@ def _extract_news_titles(pick) -> list[str]:
     return titles
 
 
+def _pick_news_summary(pick) -> str:
+    items = getattr(pick, "news_items", []) or []
+    for item in items:
+        title = str(getattr(item, "title", "") or "").strip()
+        if not title:
+            continue
+        source = str(getattr(item, "source", "") or "").strip() or "新闻"
+        published_at = str(getattr(item, "published_at", "") or "").strip()
+        relative_time = _format_relative_time_text(published_at)
+        if relative_time:
+            return f"{source}｜{title}｜{relative_time}"
+        return f"{source}｜{title}"
+
+    tdnet_titles = _extract_tdnet_titles(pick)
+    if tdnet_titles:
+        return f"TDnet公告｜{tdnet_titles[0]}"
+
+    return "无近期有效新闻"
+
+
 def _build_execution_signal_input(pick) -> ExecutionSignalInput:
     return ExecutionSignalInput(
         symbol=str(pick.symbol or "").strip(),
@@ -339,18 +502,52 @@ def _build_execution_signal_input(pick) -> ExecutionSignalInput:
     )
 
 
-def _evaluate_pick_guards(pick):
+def _format_relative_time_text(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    try:
+        normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+
+        now = datetime.now(timezone.utc)
+        delta_days = int((now - dt.astimezone(timezone.utc)).total_seconds() // 86400)
+        if delta_days < 0:
+            return "今天"
+        if delta_days == 0:
+            return "今天"
+        if delta_days == 1:
+            return "1天前"
+        return f"{delta_days}天前"
+    except Exception:
+        return ""
+
+
+def _evaluate_pick_guards(pick, *, intraday_cache: dict | None = None):
     signal_input = _build_execution_signal_input(pick)
     tdnet_titles = _extract_tdnet_titles(pick)
     news_titles = _extract_news_titles(pick)
     fetch_result = None
 
     if is_execution_candidate(signal_input):
-        fetch_result = fetch_opening_intraday_bars(
-            signal_input.symbol,
-            target_date=signal_input.run_date or None,
-            window_minutes=15,
+        cache_key = (
+            str(signal_input.symbol or "").strip(),
+            str(signal_input.run_date or "").strip(),
+            15,
         )
+        if intraday_cache is not None and cache_key in intraday_cache:
+            fetch_result = intraday_cache[cache_key]
+        else:
+            fetch_result = fetch_opening_intraday_bars(
+                signal_input.symbol,
+                target_date=signal_input.run_date or None,
+                window_minutes=15,
+            )
+            if intraday_cache is not None:
+                intraday_cache[cache_key] = fetch_result
         if fetch_result.bars:
             execution_decision = evaluate_execution_guard(
                 signal_input,
@@ -452,36 +649,177 @@ def _build_trade_advice(pick, execution_decision, news_decision) -> tuple[str, s
     return buy_advice, sell_advice, reason
 
 
+def _trade_buy_priority(value: str) -> int:
+    mapping = {"可买": 0, "观察": 1, "放弃": 2}
+    return mapping.get(str(value or "").strip(), 9)
+
+
+def _trade_level_priority(value: str) -> int:
+    mapping = {"A": 0, "B": 1, "C": 2}
+    return mapping.get(str(value or "").strip().upper(), 9)
+
+
+def _mode_display_name(mode: str) -> str:
+    return STRATEGY_LABELS.get(str(mode or "").strip(), str(mode or "").strip())
+
+
+def _is_trade_candidate(pick) -> int:
+    try:
+        return 1 if is_execution_candidate(_build_execution_signal_input(pick)) else 0
+    except Exception:
+        return 0
+
+
+def _build_compact_trade_reason(reason: str) -> str:
+    text = str(reason or "").strip()
+    if not text:
+        return "暂无"
+    parts = [part.strip() for part in text.split("，") if part.strip()]
+    return "，".join(parts[:2]) if parts else text
+
+
+def _collect_symbol_mode_entries(scan_results) -> OrderedDict[str, list[dict]]:
+    grouped: OrderedDict[str, list[dict]] = OrderedDict()
+    for mode_index, result in enumerate(scan_results or []):
+        for pick_index, pick in enumerate(result.picks or []):
+            symbol = str(pick.symbol or "").strip()
+            if not symbol:
+                continue
+            grouped.setdefault(symbol, []).append(
+                {
+                    "symbol": symbol,
+                    "mode": result.mode,
+                    "mode_index": mode_index,
+                    "pick_index": pick_index,
+                    "pick": pick,
+                    "score": float(pick.score or 0.0),
+                    "level": str(pick.level or "").strip().upper(),
+                }
+            )
+    return grouped
+
+
+def _pick_guard_representative(entries: list[dict]):
+    if not entries:
+        return None
+    ordered_entries = sorted(
+        entries,
+        key=lambda item: (
+            -_is_trade_candidate(item["pick"]),
+            _trade_level_priority(item["level"]),
+            -item["score"],
+            item["mode_index"],
+            item["pick_index"],
+        ),
+    )
+    return ordered_entries[0]["pick"]
+
+
+def _collect_trade_advice_entries(scan_results) -> list[dict]:
+    symbol_entries = _collect_symbol_mode_entries(scan_results)
+    intraday_cache: dict[tuple[str, str, int], object] = {}
+    entries = []
+    for symbol, grouped_entries in symbol_entries.items():
+        representative_pick = _pick_guard_representative(grouped_entries)
+        if representative_pick is None:
+            continue
+
+        execution_decision, news_decision, fetch_result = _evaluate_pick_guards(
+            representative_pick,
+            intraday_cache=intraday_cache,
+        )
+
+        for item in grouped_entries:
+            pick = item["pick"]
+            buy_advice, sell_advice, reason = _build_trade_advice(pick, execution_decision, news_decision)
+            entries.append(
+                {
+                    "symbol": symbol,
+                    "mode": item["mode"],
+                    "mode_index": item["mode_index"],
+                    "pick_index": item["pick_index"],
+                    "pick": pick,
+                    "buy_advice": buy_advice,
+                    "sell_advice": sell_advice,
+                    "reason": _build_compact_trade_reason(reason),
+                    "execution_status": execution_decision.execution_status or "暂无",
+                    "news_risk_level": news_decision.news_risk_level or "NEUTRAL",
+                    "score": item["score"],
+                    "level": item["level"],
+                }
+            )
+    return entries
+
+
+def _merge_trade_advice_entries(entries: list[dict]) -> list[dict]:
+    grouped: OrderedDict[str, list[dict]] = OrderedDict()
+    for entry in entries:
+        symbol = entry["symbol"]
+        if not symbol:
+            continue
+        grouped.setdefault(symbol, []).append(entry)
+
+    merged = []
+    for symbol, symbol_entries in grouped.items():
+        ordered_entries = sorted(
+            symbol_entries,
+            key=lambda item: (
+                _trade_buy_priority(item["buy_advice"]),
+                _trade_level_priority(item["level"]),
+                -item["score"],
+                item["mode_index"],
+                item["pick_index"],
+            ),
+        )
+        primary = ordered_entries[0]
+        mode_names = []
+        for item in ordered_entries:
+            mode_name = _mode_display_name(item["mode"])
+            if mode_name not in mode_names:
+                mode_names.append(mode_name)
+
+        primary["mode_names"] = mode_names
+        primary["secondary_mode_names"] = mode_names[1:]
+        merged.append(primary)
+
+    merged.sort(
+        key=lambda item: (
+            _trade_buy_priority(item["buy_advice"]),
+            _trade_level_priority(item["level"]),
+            -item["score"],
+            item["mode_index"],
+            item["pick_index"],
+        )
+    )
+    return merged
+
+
 def build_trade_advice_message(scan_results) -> str:
     if not scan_results:
         return "当前无可生成的买卖建议。"
 
-    lines = ["💡 买卖建议"]
-    for result in scan_results:
-        lines.extend(["", f"【{STRATEGY_LABELS.get(result.mode, result.mode)}】"])
-        if not result.picks:
-            lines.append("暂无候选")
-            continue
+    merged_entries = _merge_trade_advice_entries(_collect_trade_advice_entries(scan_results))
+    if not merged_entries:
+        return "当前无可生成的买卖建议。"
 
-        for pick in result.picks:
-            execution_decision, news_decision, fetch_result = _evaluate_pick_guards(pick)
-            buy_advice, sell_advice, reason = _build_trade_advice(pick, execution_decision, news_decision)
-            execution_status = execution_decision.execution_status or "暂无"
-            news_risk_level = news_decision.news_risk_level or "NEUTRAL"
-            interval_text = ""
-            if fetch_result and fetch_result.used_live_data and fetch_result.interval:
-                interval_text = f" ({fetch_result.interval})"
-            lines.extend(
-                [
-                    "",
-                    str(pick.symbol),
-                    f"买入：{buy_advice}",
-                    f"卖出：{sell_advice}",
-                    f"开盘确认：{execution_status}{interval_text}",
-                    f"消息风控：{news_risk_level}",
-                    f"理由：{reason}",
-                ]
+    lines = ["💡 买卖建议"]
+    for entry in merged_entries:
+        pick = entry["pick"]
+        repeat_tag = _signal_repeat_tag(getattr(pick, "raw", {}) or {})
+        lines.extend(
+            [
+                "",
+                f"{pick.symbol}（{repeat_tag}）｜买入: {entry['buy_advice']}｜卖出: {entry['sell_advice']}｜开盘: {entry['execution_status']}｜消息: {entry['news_risk_level']}",
+                f"理由：{entry['reason']}",
+                f"新闻：{_pick_news_summary(pick)}",
+            ]
+        )
+        if entry["secondary_mode_names"]:
+            lines.append(
+                f"主模式：{entry['mode_names'][0]}｜同时命中：{' / '.join(entry['secondary_mode_names'])}"
             )
+        else:
+            lines.append(f"命中模式：{entry['mode_names'][0]}")
     return "\n".join(lines)
 
 
@@ -492,8 +830,22 @@ def build_mode_status_message() -> str:
     return f"当前模式: {MODE_LABELS.get(mode, mode)}\n运行今日策略时将强制使用该模式。"
 
 
-def _fmt_metric(value):
-    return "暂无" if value is None else value
+def _fmt_return_pct(value):
+    if value is None:
+        return "暂无"
+    try:
+        return f"{float(value):.2f}%"
+    except Exception:
+        return "暂无"
+
+
+def _fmt_winrate_pct(value):
+    if value is None:
+        return "暂无"
+    try:
+        return f"{float(value) * 100.0:.1f}%"
+    except Exception:
+        return "暂无"
 
 
 def _fmt_group_key(group_name: str, value):
@@ -515,14 +867,14 @@ def _fmt_group_key(group_name: str, value):
 def _append_group(lines: list[str], title: str, grouped: dict, *, key_name: str, ret_field: str, winrate_field: str):
     lines.extend(["", title])
     if not grouped:
-        lines.append("- 暂无: count=0 ret_1d=暂无 winrate_1d=暂无")
+        lines.append("- 暂无：样本 0｜次日均收益 暂无｜次日胜率 暂无")
         return
 
     for key, value in grouped.items():
         lines.append(
-            f"- {_fmt_group_key(key_name, key)}: count={value.get('count', 0)} "
-            f"ret_1d={_fmt_metric(value.get(ret_field))} "
-            f"winrate_1d={_fmt_metric(value.get(winrate_field))}"
+            f"- {_fmt_group_key(key_name, key)}：样本 {value.get('count', 0)}｜"
+            f"次日均收益 {_fmt_return_pct(value.get(ret_field))}｜"
+            f"次日胜率 {_fmt_winrate_pct(value.get(winrate_field))}"
         )
 
 
@@ -539,9 +891,9 @@ def build_backtest_summary_message(summary: dict | None) -> str:
 
     lines = [
         "📊 回测汇总",
-        f"总信号数: {overall.get('count', 0)}",
-        f"1日 / 3日 / 5日平均收益: {_fmt_metric(overall.get('ret_1d_mean'))} / {_fmt_metric(overall.get('ret_3d_mean'))} / {_fmt_metric(overall.get('ret_5d_mean'))}",
-        f"1日 / 3日 / 5日胜率: {_fmt_metric(overall.get('winrate_1d'))} / {_fmt_metric(overall.get('winrate_3d'))} / {_fmt_metric(overall.get('winrate_5d'))}",
+        f"总样本：{overall.get('count', 0)}",
+        f"次日 / 3日 / 5日均收益：{_fmt_return_pct(overall.get('ret_1d_mean'))} / {_fmt_return_pct(overall.get('ret_3d_mean'))} / {_fmt_return_pct(overall.get('ret_5d_mean'))}",
+        f"次日 / 3日 / 5日胜率：{_fmt_winrate_pct(overall.get('winrate_1d'))} / {_fmt_winrate_pct(overall.get('winrate_3d'))} / {_fmt_winrate_pct(overall.get('winrate_5d'))}",
     ]
 
     _append_group(
@@ -636,9 +988,22 @@ async def ensure_result(update: Update, *, force_run: bool = False):
     if LAST_RESULT is not None and not force_run:
         return LAST_RESULT
 
-    mode = resolve_picker_mode()
-    await update.message.reply_text("开始执行今日策略，请稍候…", reply_markup=MAIN_MENU)
-    LAST_RESULT = run_picker_result(limit=5, candidate_limit=30, mode=mode)
+    _, scan_results = load_latest_stored_scan_results()
+    if not scan_results:
+        raise RuntimeError("未找到当日已落盘信号，请先确认 data/backtest/signals.csv 已生成 scan 结果。")
+
+    preferred_mode = resolve_picker_mode()
+    if preferred_mode:
+        LAST_RESULT = next((result for result in scan_results if result.mode == preferred_mode), scan_results[0])
+    else:
+        LAST_RESULT = sorted(
+            scan_results,
+            key=lambda result: (
+                -len(_group_picks(result)["A"]),
+                -len(_group_picks(result)["B"]),
+                -(max([float(pick.score or 0.0) for pick in result.picks], default=0.0)),
+            ),
+        )[0]
     return LAST_RESULT
 
 
@@ -647,8 +1012,10 @@ async def ensure_scan_results(update: Update, *, force_run: bool = False):
     if LAST_SCAN_RESULTS is not None and not force_run:
         return LAST_SCAN_RESULTS
 
-    await update.message.reply_text("开始执行三模式扫描，请稍候…", reply_markup=MAIN_MENU)
-    LAST_SCAN_RESULTS = run_multi_mode_scan_results(limit=5, candidate_limit=30)
+    _, scan_results = load_latest_stored_scan_results()
+    if not scan_results:
+        raise RuntimeError("未找到当日已落盘三模式信号，请先确认 data/backtest/signals.csv 已生成 scan 结果。")
+    LAST_SCAN_RESULTS = scan_results
     return LAST_SCAN_RESULTS
 
 
@@ -657,6 +1024,7 @@ async def handle_run_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     log(f"[RUN] chat_id={chat_id} mode={get_bot_mode()}")
     try:
+        await update.message.reply_text("读取当日已落盘三模式信号，请稍候…", reply_markup=MAIN_MENU)
         scan_results = await ensure_scan_results(update, force_run=True)
         await update.message.reply_text(build_multi_mode_run_message(scan_results), reply_markup=MAIN_MENU)
         log(f"[RUN] done chat_id={chat_id} multi_mode_count={len(scan_results)}")
@@ -666,8 +1034,8 @@ async def handle_run_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_today_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        result = await ensure_result(update)
-        await update.message.reply_text(build_today_summary(result), reply_markup=MAIN_MENU)
+        scan_results = await ensure_scan_results(update, force_run=True)
+        await update.message.reply_text(build_today_summary(scan_results), reply_markup=MAIN_MENU)
     except Exception as exc:
         await update.message.reply_text(f"读取今日结论失败: {exc}", reply_markup=MAIN_MENU)
 

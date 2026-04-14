@@ -6,6 +6,7 @@ const state = {
   currentSymbol: null,
   currentSignalId: null,
   signals: [],
+  signalHistoryBySymbol: {},
   chart: null,
   candleSeries: null,
 };
@@ -58,6 +59,105 @@ function displayLevel(value) {
 
 function displayAction(value) {
   return actionLabels[value] || displayValue(value);
+}
+
+function displayRepeatSignalTag(signal) {
+  const consecutiveDays = Number(signal?.consecutive_days);
+  if (!Number.isFinite(consecutiveDays) || consecutiveDays <= 1) {
+    return '新';
+  }
+  return `连${consecutiveDays}`;
+}
+
+function displayRelativeTimeText(value) {
+  const text = String(value || '').trim();
+  if (!text) {
+    return '';
+  }
+
+  try {
+    const normalized = text.endsWith('Z') ? `${text.slice(0, -1)}+00:00` : text;
+    const dt = new Date(normalized);
+    if (Number.isNaN(dt.getTime())) {
+      return '';
+    }
+
+    const now = new Date();
+    const deltaDays = Math.floor((now.getTime() - dt.getTime()) / 86400000);
+    if (deltaDays <= 0) {
+      return '今天';
+    }
+    if (deltaDays === 1) {
+      return '1天前';
+    }
+    return `${deltaDays}天前`;
+  } catch (error) {
+    return '';
+  }
+}
+
+function displayNewsSummary(signal) {
+  const newsTitle = String(signal?.news_title || '').trim();
+  const newsSource = String(signal?.news_source || '').trim() || '新闻';
+  const newsPublishedAt = String(signal?.news_published_at || '').trim();
+  if (newsTitle) {
+    const relativeTime = displayRelativeTimeText(newsPublishedAt);
+    if (relativeTime) {
+      return `${newsSource}｜${newsTitle}｜${relativeTime}`;
+    }
+    return `${newsSource}｜${newsTitle}`;
+  }
+
+  const tdnetTitle = String(signal?.tdnet_title || '').trim();
+  if (tdnetTitle) {
+    const firstTitle = tdnetTitle.split('|')[0].trim();
+    if (firstTitle) {
+      return `TDnet公告｜${firstTitle}`;
+    }
+  }
+
+  return '无近期有效新闻';
+}
+
+function getLatestSignalForSymbol(symbol) {
+  const symbolKey = String(symbol || '').trim();
+  const records = state.signalHistoryBySymbol[symbolKey] || [];
+  if (!records.length) {
+    return null;
+  }
+
+  return [...records].sort((a, b) => {
+    const dateCompare = String(b.run_date || '').localeCompare(String(a.run_date || ''));
+    if (dateCompare !== 0) {
+      return dateCompare;
+    }
+    const rankA = Number(a.rank ?? 9999);
+    const rankB = Number(b.rank ?? 9999);
+    return rankA - rankB;
+  })[0];
+}
+
+async function ensureSignalHistory(symbol) {
+  const symbolKey = String(symbol || '').trim();
+  if (!symbolKey) {
+    return [];
+  }
+  if (state.signalHistoryBySymbol[symbolKey]) {
+    return state.signalHistoryBySymbol[symbolKey];
+  }
+
+  const records = await fetchJson(`/api/signals/${symbolKey}`);
+  state.signalHistoryBySymbol[symbolKey] = Array.isArray(records) ? records : [];
+  return state.signalHistoryBySymbol[symbolKey];
+}
+
+async function preloadSignalHistory(records) {
+  const symbols = [...new Set((records || []).map((item) => String(item.symbol || '').trim()).filter(Boolean))];
+  if (!symbols.length) {
+    return;
+  }
+
+  await Promise.all(symbols.map((symbol) => ensureSignalHistory(symbol)));
 }
 
 function groupSignalsByDate(records) {
@@ -173,13 +273,15 @@ function renderSignalDetail(signal) {
   detail.textContent = [
     `当前查看信号日期: ${displayValue(signal.run_date)}`,
     `信号编号: ${displayValue(signal.signal_id)}`,
-    `策略类型: ${displayStrategy(signal.selected_mode)}`,
+    `策略类型: ${displayStrategy(signal.selected_mode)}（${displayRepeatSignalTag(signal)}）`,
     `策略来源: ${displayStrategySource(signal.strategy_source)}`,
     `市场状态: ${displayValue(signal.market_state)}`,
     `信号排序: ${displayValue(signal.rank)}`,
     `得分: ${displayValue(signal.score)}`,
     `信号等级: ${displayLevel(signal.level)}`,
     `操作建议: ${displayAction(signal.action)}`,
+    `连续信号标记: ${displayRepeatSignalTag(signal)}`,
+    `新闻: ${displayNewsSummary(signal)}`,
     `期权方向: ${displayValue(signal.option_bias, '暂无')}`,
     `参考周期: ${displayValue(signal.option_horizon, '暂无')}`,
     `期权逻辑: ${displayValue(signal.option_reason, '暂无')}`,
@@ -220,6 +322,7 @@ function renderSignalList(signals, selectedSignalId = null) {
 
   const initialSignal = signals.find((signal) => signal.signal_id === selectedSignalId) || signals[0];
   signals.forEach((signal, index) => {
+    const repeatTag = displayRepeatSignalTag(signal);
     const item = document.createElement('div');
     item.className = `signal-item${signal.signal_id === initialSignal.signal_id ? ' active' : ''}`;
     item.dataset.signalId = signal.signal_id;
@@ -228,7 +331,7 @@ function renderSignalList(signals, selectedSignalId = null) {
         <span>${signal.run_date || '-'}</span>
         <span class="tag ${signal.level || 'C'}">${displayLevel(signal.level)}</span>
       </div>
-      <div>${displayStrategy(signal.selected_mode)} / ${displayAction(signal.action)}</div>
+      <div>${displayStrategy(signal.selected_mode)} / ${displayAction(signal.action)}（${repeatTag}）</div>
       <div class="hint">得分=${signal.score ?? '-'} 排名=${signal.rank ?? '-'}</div>
     `;
     item.addEventListener('click', () => {
@@ -298,6 +401,7 @@ async function loadSymbol(symbol, selectedSignalId = null) {
   ]);
 
   state.signals = signals;
+  state.signalHistoryBySymbol[String(symbol || '').trim()] = Array.isArray(signals) ? signals : [];
   setChartData(candles, signals);
   renderSignalList(signals, selectedSignalId);
 }
@@ -319,7 +423,7 @@ function populateDateSelect(dates) {
   });
 }
 
-function populateSignalSelect(runDate, selectedSignalId = null) {
+async function populateSignalSelect(runDate, selectedSignalId = null) {
   const select = document.getElementById('signal-select');
   select.innerHTML = '';
 
@@ -329,10 +433,14 @@ function populateSignalSelect(runDate, selectedSignalId = null) {
     return null;
   }
 
+  await preloadSignalHistory(records);
+
   records.forEach((item) => {
+    const latestSignal = getLatestSignalForSymbol(item.symbol) || item;
+    const repeatTag = displayRepeatSignalTag(latestSignal);
     const option = document.createElement('option');
     option.value = item.signal_id;
-    option.textContent = `${displayStrategy(item.selected_mode)} | ${item.symbol} | ${displayLevel(item.level)} | ${displayAction(item.action)}`;
+    option.textContent = `${displayStrategy(item.selected_mode)} | ${item.symbol} | ${displayLevel(item.level)} | ${displayAction(item.action)}（${repeatTag}）`;
     select.appendChild(option);
   });
 
@@ -362,7 +470,7 @@ async function init() {
   populateDateSelect(state.availableDates);
   state.currentDate = state.availableDates[0];
   dateSelect.value = state.currentDate;
-  const initialRecord = populateSignalSelect(state.currentDate, symbols[0].signal_id);
+  const initialRecord = await populateSignalSelect(state.currentDate, symbols[0].signal_id);
 
   if (initialRecord) {
     state.currentSignalId = initialRecord.signal_id;
@@ -371,7 +479,7 @@ async function init() {
 
   dateSelect.addEventListener('change', async (event) => {
     state.currentDate = event.target.value;
-    const target = populateSignalSelect(state.currentDate);
+    const target = await populateSignalSelect(state.currentDate);
     if (!target) {
       renderSummary(null);
       renderSignalDetail(null);
