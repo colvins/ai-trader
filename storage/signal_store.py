@@ -37,6 +37,9 @@ SIGNAL_COLUMNS = [
     "news_title",
     "news_source",
     "news_published_at",
+    "execution_result",
+    "execution_checked_at",
+    "news_risk_level",
     "close",
     "prev_close",
     "day_change_pct",
@@ -94,6 +97,9 @@ def _ensure_signal_columns(df: pd.DataFrame) -> pd.DataFrame:
     current["news_title"] = current["news_title"].fillna("")
     current["news_source"] = current["news_source"].fillna("")
     current["news_published_at"] = current["news_published_at"].fillna("")
+    current["execution_result"] = current["execution_result"].fillna("")
+    current["execution_checked_at"] = current["execution_checked_at"].fillna("")
+    current["news_risk_level"] = current["news_risk_level"].fillna("")
     current["is_repeat_signal"] = pd.to_numeric(current["is_repeat_signal"], errors="coerce").fillna(0).astype(int)
     current["consecutive_days"] = pd.to_numeric(current["consecutive_days"], errors="coerce").fillna(1).astype(int)
     return current
@@ -204,6 +210,9 @@ def build_signal_rows(result: PickResult) -> list[dict]:
                 "news_title": news_title,
                 "news_source": news_source,
                 "news_published_at": news_published_at,
+                "execution_result": str(pick.raw.get("execution_result", "") or ""),
+                "execution_checked_at": str(pick.raw.get("execution_checked_at", "") or ""),
+                "news_risk_level": str(pick.raw.get("news_risk_level", "") or ""),
                 "close": pick.close,
                 "prev_close": pick.prev_close,
                 "day_change_pct": pick.day_change_pct,

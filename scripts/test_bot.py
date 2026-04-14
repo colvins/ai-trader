@@ -31,22 +31,12 @@ from analysis.execution_guard import (
 )
 from analysis.intraday_data import fetch_opening_intraday_bars
 from analysis.news_guard import evaluate_news_guard
-from reporting.formatters.telegram_formatter import format_ai_prompt, format_pick_result
 from reporting.schemas import DataStatus, MarketState, NewsItem, PickResult, StockPick
 from scripts.run_backtest import SUMMARY_FILE, build_backtest_summary, save_backtest_summary
-from scripts.update_backtest_results import update_backtest_results
-from storage.backtest_store import load_signals
-from storage.runtime_state import get_bot_mode, save_bot_mode_state
+from storage.backtest_store import load_signals, save_execution_feedback
 
 
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-
-MODE_LABELS = {
-    "auto": "自动模式",
-    "breakout": "强制短线打板 / 追涨",
-    "trend": "强制趋势跟随",
-    "dip": "强制低吸反弹",
-}
 
 STRATEGY_LABELS = {
     "breakout": "短线打板 / 追涨",
@@ -66,66 +56,23 @@ LEVEL_LABELS = {
     "C": "C级",
 }
 
-HOME_BUTTON = "⬅ 返回首页"
-
 MAIN_MENU = ReplyKeyboardMarkup(
     keyboard=[
         ["🤖 运行今日策略", "📌 今日结论"],
-        ["📊 回测汇总", "⚙ 模式切换"],
-        ["📝 更多"],
+        ["💡 买卖建议", "🧠 AI精选分析"],
+        ["📊 回测汇总"],
     ],
     resize_keyboard=True,
     one_time_keyboard=False,
     input_field_placeholder="请选择功能…",
 )
 
-MORE_MENU = ReplyKeyboardMarkup(
-    keyboard=[
-        ["🟢 A级信号", "🟡 B级观察"],
-        ["💡 买卖建议", "🧠 AI分析输入"],
-        ["📈 更新回测结果"],
-        [HOME_BUTTON],
-    ],
-    resize_keyboard=True,
-    one_time_keyboard=False,
-    input_field_placeholder="更多功能…",
-)
-
-MODE_MENU = ReplyKeyboardMarkup(
-    keyboard=[
-        ["自动模式", "强制低吸反弹"],
-        ["强制趋势跟随", "强制短线打板 / 追涨"],
-        ["查看当前模式"],
-        [HOME_BUTTON],
-    ],
-    resize_keyboard=True,
-    one_time_keyboard=False,
-    input_field_placeholder="请选择模式…",
-)
-
-MODE_BUTTON_TO_STATE = {
-    "自动模式": "auto",
-    "强制低吸反弹": "dip",
-    "强制趋势跟随": "trend",
-    "强制短线打板 / 追涨": "breakout",
-}
-
-LAST_RESULT = None
 LAST_SCAN_RESULTS = None
 SCAN_MODES = ("dip", "trend", "breakout")
 
 
 def log(msg: str):
     print(msg, flush=True)
-
-
-def current_mode_label() -> str:
-    return MODE_LABELS.get(get_bot_mode(), "自动模式")
-
-
-def resolve_picker_mode() -> str | None:
-    current = get_bot_mode()
-    return None if current == "auto" else current
 
 
 def _signal_repeat_tag(raw: dict) -> str:
@@ -402,38 +349,6 @@ def build_run_result_message(result) -> str:
     return "\n".join(lines)
 
 
-def build_a_signals_message(result) -> str:
-    a_picks = _group_picks(result)["A"]
-    if not a_picks:
-        return "当前无A级信号"
-
-    lines = ["🟢 A级信号"]
-    for pick in a_picks:
-        lines.append(
-            f"- {pick.symbol} | 得分={pick.score} | 操作建议={ACTION_LABELS.get(pick.action, pick.action)} | {pick.reason}"
-        )
-        lines.append(
-            f"  期权方向: {pick.option_bias or '暂无'} | 公告信号: {str(pick.raw.get('tdnet_signal', '') or '暂无')}"
-        )
-    return "\n".join(lines)
-
-
-def build_b_signals_message(result) -> str:
-    b_picks = _group_picks(result)["B"][:3]
-    if not b_picks:
-        return "当前无B级观察信号"
-
-    lines = ["🟡 B级观察"]
-    for pick in b_picks:
-        lines.append(
-            f"- {pick.symbol} | 得分={pick.score} | 操作建议={ACTION_LABELS.get(pick.action, pick.action)} | {pick.reason}"
-        )
-        lines.append(
-            f"  期权方向: {pick.option_bias or '暂无'} | 公告信号: {str(pick.raw.get('tdnet_signal', '') or '暂无')}"
-        )
-    return "\n".join(lines)
-
-
 def _pick_extra_value(pick, key: str, default=None):
     value = getattr(pick, key, None)
     if value not in (None, ""):
@@ -659,8 +574,23 @@ def _trade_level_priority(value: str) -> int:
     return mapping.get(str(value or "").strip().upper(), 9)
 
 
+def _execution_priority(value: str) -> int:
+    mapping = {"BUY_READY": 0, "WATCH": 1, "": 2, "暂无": 2, "SKIP": 3}
+    return mapping.get(str(value or "").strip().upper(), 9)
+
+
 def _mode_display_name(mode: str) -> str:
     return STRATEGY_LABELS.get(str(mode or "").strip(), str(mode or "").strip())
+
+
+def _fmt_ai_field(value, digits: int = 2) -> str:
+    if value in (None, ""):
+        return "暂无"
+    try:
+        return f"{float(value):.{digits}f}"
+    except Exception:
+        text = str(value).strip()
+        return text or "暂无"
 
 
 def _is_trade_candidate(pick) -> int:
@@ -676,6 +606,12 @@ def _build_compact_trade_reason(reason: str) -> str:
         return "暂无"
     parts = [part.strip() for part in text.split("，") if part.strip()]
     return "，".join(parts[:2]) if parts else text
+
+
+def _pick_execution_result(pick) -> str:
+    raw = getattr(pick, "raw", {}) or {}
+    value = str(raw.get("execution_result", "") or raw.get("execution_status", "") or "").strip().upper()
+    return value
 
 
 def _collect_symbol_mode_entries(scan_results) -> OrderedDict[str, list[dict]]:
@@ -699,6 +635,120 @@ def _collect_symbol_mode_entries(scan_results) -> OrderedDict[str, list[dict]]:
     return grouped
 
 
+def _pick_ai_primary_entry(entries: list[dict]) -> dict | None:
+    if not entries:
+        return None
+    ordered_entries = sorted(
+        entries,
+        key=lambda item: (
+            _execution_priority(_pick_execution_result(item["pick"])),
+            _trade_level_priority(item["level"]),
+            -int(((getattr(item["pick"], "raw", {}) or {}).get("consecutive_days", 1) or 1)),
+            -item["score"],
+            item["mode_index"],
+            item["pick_index"],
+        ),
+    )
+    return ordered_entries[0]
+
+
+def _select_ai_focus_picks(scan_results, limit: int = 5) -> list[dict]:
+    symbol_entries = _collect_symbol_mode_entries(scan_results)
+    selected = []
+    for symbol, entries in symbol_entries.items():
+        primary = _pick_ai_primary_entry(entries)
+        if primary is None:
+            continue
+        pick = primary["pick"]
+        level = str(primary["level"] or "").upper()
+        execution_result = _pick_execution_result(pick)
+        if level == "C" or execution_result == "SKIP":
+            continue
+        selected.append(
+            {
+                "symbol": symbol,
+                "mode": primary["mode"],
+                "pick": pick,
+                "score": float(primary["score"] or 0.0),
+                "level": level,
+                "execution_result": execution_result,
+                "consecutive_days": int(((getattr(pick, "raw", {}) or {}).get("consecutive_days", 1) or 1)),
+            }
+        )
+
+    selected.sort(
+        key=lambda item: (
+            _execution_priority(item["execution_result"]),
+            _trade_level_priority(item["level"]),
+            -item["consecutive_days"],
+            -item["score"],
+            item["symbol"],
+        )
+    )
+    return selected[:limit]
+
+
+def build_ai_focus_prompt_message(scan_results) -> str:
+    if not scan_results:
+        return "当前暂无可生成的 AI精选分析。"
+
+    focus_picks = _select_ai_focus_picks(scan_results, limit=5)
+    if not focus_picks:
+        return "当前暂无符合条件的 AI精选分析标的。"
+
+    lines = [
+        "🧠 AI分析输入（精选）",
+        "",
+        "===== AI分析输入（复制到ChatGPT）=====",
+        "",
+        "请作为短线交易分析师，基于技术面 + 市场行为，判断以下股票：",
+        "",
+    ]
+
+    for index, item in enumerate(focus_picks, start=1):
+        pick = item["pick"]
+        repeat_tag = _signal_repeat_tag(getattr(pick, "raw", {}) or {})
+        lines.extend(
+            [
+                f"【股票{index}】",
+                f"模式: {item['mode']}",
+                f"代码: {pick.symbol}",
+                f"当前价格: {_fmt_ai_field(pick.close)}",
+                f"本地评分: {_fmt_ai_field(pick.score, digits=4)}",
+                f"信号: {repeat_tag}",
+                "",
+                "技术面:",
+                "",
+                f"* 今日涨幅: {_fmt_ai_field(pick.day_change_pct)}",
+                f"* 振幅: {_fmt_ai_field(pick.amplitude_pct)}",
+                f"* 量比: {_fmt_ai_field(pick.amount_ratio_5)}",
+                f"* 3日动量: {_fmt_ai_field(pick.momentum_3_pct)}",
+                f"* 5日动量: {_fmt_ai_field(pick.momentum_5_pct)}",
+                f"* 距20日高点: {_fmt_ai_field(pick.dist_to_high_20_pct)}",
+                f"* 收盘位置: {_fmt_ai_field(pick.close_position)}",
+                "",
+            ]
+        )
+
+    lines.extend(
+        [
+            "（最多5只）",
+            "",
+            "---",
+            "",
+            "请逐只回答：",
+            "",
+            "1. 是否值得关注（是/否）",
+            "2. 更偏哪种模式（breakout/trend/dip/不明确）",
+            "3. 核心逻辑（一句话）",
+            "4. 最大风险（一句话）",
+            "",
+            "===== 结束 =====",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def _pick_guard_representative(entries: list[dict]):
     if not entries:
         return None
@@ -718,6 +768,7 @@ def _pick_guard_representative(entries: list[dict]):
 def _collect_trade_advice_entries(scan_results) -> list[dict]:
     symbol_entries = _collect_symbol_mode_entries(scan_results)
     intraday_cache: dict[tuple[str, str, int], object] = {}
+    checked_at = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     entries = []
     for symbol, grouped_entries in symbol_entries.items():
         representative_pick = _pick_guard_representative(grouped_entries)
@@ -744,11 +795,32 @@ def _collect_trade_advice_entries(scan_results) -> list[dict]:
                     "reason": _build_compact_trade_reason(reason),
                     "execution_status": execution_decision.execution_status or "暂无",
                     "news_risk_level": news_decision.news_risk_level or "NEUTRAL",
+                    "execution_checked_at": checked_at,
                     "score": item["score"],
                     "level": item["level"],
                 }
             )
     return entries
+
+
+def _build_execution_feedback_updates(entries: list[dict]) -> list[dict]:
+    updates = []
+    for entry in entries or []:
+        pick = entry.get("pick")
+        raw = getattr(pick, "raw", {}) or {}
+        updates.append(
+            {
+                "signal_id": str(raw.get("signal_id", "") or "").strip(),
+                "run_date": str(raw.get("run_date", "") or "").strip(),
+                "selected_mode": str(raw.get("selected_mode", "") or entry.get("mode", "") or "").strip(),
+                "strategy_source": str(raw.get("strategy_source", "") or "scan").strip(),
+                "symbol": str(getattr(pick, "symbol", "") or entry.get("symbol", "") or "").strip(),
+                "execution_result": str(entry.get("execution_status", "") or "").strip().upper(),
+                "execution_checked_at": str(entry.get("execution_checked_at", "") or "").strip(),
+                "news_risk_level": str(entry.get("news_risk_level", "") or "").strip().upper(),
+            }
+        )
+    return updates
 
 
 def _merge_trade_advice_entries(entries: list[dict]) -> list[dict]:
@@ -794,11 +866,12 @@ def _merge_trade_advice_entries(entries: list[dict]) -> list[dict]:
     return merged
 
 
-def build_trade_advice_message(scan_results) -> str:
+def build_trade_advice_message(scan_results, *, entries: list[dict] | None = None) -> str:
     if not scan_results:
         return "当前无可生成的买卖建议。"
 
-    merged_entries = _merge_trade_advice_entries(_collect_trade_advice_entries(scan_results))
+    raw_entries = entries if entries is not None else _collect_trade_advice_entries(scan_results)
+    merged_entries = _merge_trade_advice_entries(raw_entries)
     if not merged_entries:
         return "当前无可生成的买卖建议。"
 
@@ -823,18 +896,20 @@ def build_trade_advice_message(scan_results) -> str:
     return "\n".join(lines)
 
 
-def build_mode_status_message() -> str:
-    mode = get_bot_mode()
-    if mode == "auto":
-        return "当前模式: 自动模式\n运行今日策略时将根据市场状态自动选择低吸反弹、趋势跟随或短线打板 / 追涨。"
-    return f"当前模式: {MODE_LABELS.get(mode, mode)}\n运行今日策略时将强制使用该模式。"
-
-
 def _fmt_return_pct(value):
     if value is None:
         return "暂无"
     try:
         return f"{float(value):.2f}%"
+    except Exception:
+        return "暂无"
+
+
+def _fmt_signed_return_pct(value):
+    if value is None:
+        return "暂无"
+    try:
+        return f"{float(value):+.2f}%"
     except Exception:
         return "暂无"
 
@@ -878,9 +953,50 @@ def _append_group(lines: list[str], title: str, grouped: dict, *, key_name: str,
         )
 
 
+def _append_execution_backtest(lines: list[str], execution_summary: dict):
+    window_days = int(execution_summary.get("window_days", 30) or 30)
+    by_execution = execution_summary.get("by_execution_result", {}) or {}
+    by_mode_execution = execution_summary.get("by_mode_execution", []) or []
+
+    lines.extend(["", f"🧠 执行层统计（近{window_days}天）"])
+    for status, label in (
+        ("BUY_READY", "BUY_READY（可执行）"),
+        ("WATCH", "WATCH（观察）"),
+        ("SKIP", "SKIP（放弃）"),
+    ):
+        stats = by_execution.get(status, {}) or {}
+        lines.extend(
+            [
+                "",
+                label,
+                f"样本：{stats.get('count', 0)}",
+                f"次日均收益：{_fmt_signed_return_pct(stats.get('ret_1d_mean'))}",
+                f"次日胜率：{_fmt_winrate_pct(stats.get('winrate_1d'))}",
+                f"3日收益：{_fmt_signed_return_pct(stats.get('ret_3d_mean'))}",
+                f"5日收益：{_fmt_signed_return_pct(stats.get('ret_5d_mean'))}",
+            ]
+        )
+
+    lines.extend(["", f"📊 策略 × 执行（近{window_days}天）"])
+    if not by_mode_execution:
+        lines.append("暂无 execution_result 数据")
+        return
+
+    for row in by_mode_execution:
+        mode_label = str(row.get("selected_mode_label", "") or row.get("selected_mode", "") or "").strip()
+        execution_result = str(row.get("execution_result", "") or "").strip()
+        lines.extend(
+            [
+                "",
+                f"{mode_label} + {execution_result}",
+                f"样本 {row.get('count', 0)}｜次日 {_fmt_signed_return_pct(row.get('ret_1d_mean'))}｜胜率 {_fmt_winrate_pct(row.get('winrate_1d'))}",
+            ]
+        )
+
+
 def build_backtest_summary_message(summary: dict | None) -> str:
     if not summary:
-        return "暂无回测汇总，请先点击“📈 更新回测结果”。"
+        return "暂无回测汇总，请先等待每日自动回测刷新。"
 
     overall = summary.get("overall", {})
     no_future = (
@@ -936,6 +1052,7 @@ def build_backtest_summary_message(summary: dict | None) -> str:
         ret_field="ret_1d_mean",
         winrate_field="winrate_1d",
     )
+    _append_execution_backtest(lines, summary.get("execution_backtest", {}) or {})
 
     if no_future:
         lines.extend(["", "暂无未来交易日结果"])
@@ -966,7 +1083,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     log(f"[MSG] /start chat_id={update.effective_chat.id}")
     text = (
         "AI 股票 Bot 已启动。\n\n"
-        "当前版本只聚焦：运行策略、查看结论、回测汇总、模式切换。"
+        "当前版本只聚焦：运行策略、查看结论、回测汇总。"
     )
     await update.message.reply_text(text, reply_markup=MAIN_MENU)
 
@@ -976,35 +1093,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "首页功能：\n"
         "🤖 运行今日策略\n"
         "📌 今日结论\n"
+        "💡 买卖建议\n"
+        "🧠 AI精选分析\n"
         "📊 回测汇总\n"
-        "⚙ 模式切换\n"
-        "📝 更多"
     )
     await update.message.reply_text(text, reply_markup=MAIN_MENU)
-
-
-async def ensure_result(update: Update, *, force_run: bool = False):
-    global LAST_RESULT
-    if LAST_RESULT is not None and not force_run:
-        return LAST_RESULT
-
-    _, scan_results = load_latest_stored_scan_results()
-    if not scan_results:
-        raise RuntimeError("未找到当日已落盘信号，请先确认 data/backtest/signals.csv 已生成 scan 结果。")
-
-    preferred_mode = resolve_picker_mode()
-    if preferred_mode:
-        LAST_RESULT = next((result for result in scan_results if result.mode == preferred_mode), scan_results[0])
-    else:
-        LAST_RESULT = sorted(
-            scan_results,
-            key=lambda result: (
-                -len(_group_picks(result)["A"]),
-                -len(_group_picks(result)["B"]),
-                -(max([float(pick.score or 0.0) for pick in result.picks], default=0.0)),
-            ),
-        )[0]
-    return LAST_RESULT
 
 
 async def ensure_scan_results(update: Update, *, force_run: bool = False):
@@ -1022,7 +1115,7 @@ async def ensure_scan_results(update: Update, *, force_run: bool = False):
 async def handle_run_today(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global LAST_SCAN_RESULTS
     chat_id = update.effective_chat.id
-    log(f"[RUN] chat_id={chat_id} mode={get_bot_mode()}")
+    log(f"[RUN] chat_id={chat_id} mode=multi_scan")
     try:
         await update.message.reply_text("读取当日已落盘三模式信号，请稍候…", reply_markup=MAIN_MENU)
         scan_results = await ensure_scan_results(update, force_run=True)
@@ -1040,54 +1133,24 @@ async def handle_today_summary(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(f"读取今日结论失败: {exc}", reply_markup=MAIN_MENU)
 
 
-async def handle_more_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("更多功能", reply_markup=MORE_MENU)
-
-
-async def handle_mode_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(build_mode_status_message(), reply_markup=MODE_MENU)
-
-
-async def handle_a_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    result = await ensure_result(update)
-    await update.message.reply_text(build_a_signals_message(result), reply_markup=MORE_MENU)
-
-
-async def handle_b_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    result = await ensure_result(update)
-    await update.message.reply_text(build_b_signals_message(result), reply_markup=MORE_MENU)
-
-
-async def handle_ai_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    result = await ensure_result(update)
-    await update.message.reply_text(format_ai_prompt(result), reply_markup=MORE_MENU)
+async def handle_ai_focus_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    scan_results = await ensure_scan_results(update)
+    await update.message.reply_text(build_ai_focus_prompt_message(scan_results), reply_markup=MAIN_MENU)
 
 
 async def handle_trade_advice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     scan_results = await ensure_scan_results(update)
-    await update.message.reply_text(build_trade_advice_message(scan_results), reply_markup=MORE_MENU)
-
-
-async def handle_update_backtest(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("开始更新回测结果，请稍候…", reply_markup=MORE_MENU)
-    try:
-        result = update_backtest_results()
-        if not result["ok"]:
-            await update.message.reply_text(f"执行失败: {result['message']}", reply_markup=MORE_MENU)
-            return
-
-        summary = build_backtest_summary()
-        if summary:
-            save_backtest_summary(summary)
-
-        msg = (
-            "回测结果更新完成\n"
-            f"信号数: {result['count']}\n"
-            f"已补全 ret_5d: {result['ret_5d_ready']}"
+    entries = _collect_trade_advice_entries(scan_results)
+    feedback_result = save_execution_feedback(_build_execution_feedback_updates(entries))
+    if feedback_result.get("results_updated", 0) or feedback_result.get("signals_updated", 0):
+        log(
+            f"[TRADE_ADVICE] execution feedback saved results={feedback_result.get('results_updated', 0)} "
+            f"signals={feedback_result.get('signals_updated', 0)}"
         )
-        await update.message.reply_text(msg, reply_markup=MORE_MENU)
-    except Exception as exc:
-        await update.message.reply_text(f"执行失败: {exc}", reply_markup=MORE_MENU)
+    await update.message.reply_text(
+        build_trade_advice_message(scan_results, entries=entries),
+        reply_markup=MAIN_MENU,
+    )
 
 
 async def handle_backtest_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1097,15 +1160,6 @@ async def handle_backtest_summary(update: Update, context: ContextTypes.DEFAULT_
         if summary:
             save_backtest_summary(summary)
     await update.message.reply_text(build_backtest_summary_message(summary), reply_markup=MAIN_MENU)
-
-
-async def handle_mode_set(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str):
-    save_bot_mode_state(mode)
-    await update.message.reply_text(f"已切换为：{MODE_LABELS.get(mode, mode)}", reply_markup=MODE_MENU)
-
-
-async def handle_show_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(build_mode_status_message(), reply_markup=MODE_MENU)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1121,35 +1175,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "📊 回测汇总":
         await handle_backtest_summary(update, context)
         return
-    if text == "⚙ 模式切换":
-        await handle_mode_menu(update, context)
-        return
-    if text == "📝 更多":
-        await handle_more_menu(update, context)
-        return
-    if text == "🟢 A级信号":
-        await handle_a_signals(update, context)
-        return
-    if text == "🟡 B级观察":
-        await handle_b_signals(update, context)
-        return
     if text == "💡 买卖建议":
         await handle_trade_advice(update, context)
         return
-    if text == "🧠 AI分析输入":
-        await handle_ai_input(update, context)
-        return
-    if text == "📈 更新回测结果":
-        await handle_update_backtest(update, context)
-        return
-    if text == HOME_BUTTON:
-        await update.message.reply_text("返回首页", reply_markup=MAIN_MENU)
-        return
-    if text == "查看当前模式":
-        await handle_show_mode(update, context)
-        return
-    if text in MODE_BUTTON_TO_STATE:
-        await handle_mode_set(update, context, MODE_BUTTON_TO_STATE[text])
+    if text == "🧠 AI精选分析":
+        await handle_ai_focus_input(update, context)
         return
 
     if text.lower() == "run":
